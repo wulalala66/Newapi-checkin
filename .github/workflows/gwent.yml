@@ -1,0 +1,40 @@
+name: 维云翻卡 (每2小时)
+
+on:
+  # 每天 24 次整点检查翻卡(charges_max=2, 使用后 7200s 恢复 1 格)
+  schedule:
+    - cron: '0 */2 * * *'
+  # 手动触发
+  workflow_dispatch:
+
+jobs:
+  gwent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 安装 Playwright 浏览器
+        run: playwright install chromium --with-deps
+
+      - name: 确认 Chrome 与 xvfb
+        run: |
+          google-chrome --version || true
+          which xvfb-run || sudo apt-get install -y xvfb || true
+
+      - name: 执行翻卡 (xvfb 虚拟显示,浏览器内过 CF 翻 gwent)
+        env:
+          CONFIG_URL: ${{ secrets.CONFIG_URL }}
+          CONFIG_AUTH: ${{ secrets.CONFIG_AUTH }}
+          NEWAPI_ACCOUNTS: ${{ secrets.NEWAPI_ACCOUNTS }}
+        run: xvfb-run --auto-servernum python checkin.py --gwent-only

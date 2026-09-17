@@ -150,15 +150,24 @@ def run_gwent_for_account(session, base_url: str) -> tuple:
     if d.get("success"):
         data = d["data"]
         prize = data.get("prize", {})
-        charges_current = data.get("charges_current", 0)
+        # 每次抽完读取剩余次数(charges_current + extra_draws_left),避免超抽触发风控
+        try:
+            charges_current = int(data.get("charges_current", 0) or 0)
+        except (TypeError, ValueError):
+            charges_current = 0
+        try:
+            extra_left = int(data.get("extra_draws_left", 0) or 0)
+        except (TypeError, ValueError):
+            extra_left = 0
+        remaining = charges_current + extra_left
         return {
             "prize_name": prize.get("name", "?"),
             "quota_awarded": prize.get("quota", 0),
-            "remaining_times": charges_current,
+            "remaining_times": remaining,
         }, None
 
     msg = d.get("message", "翻卡失败")
     # ponytail: cooldown = today done, same treatment as "今日已抽奖完成"
-    if "冷却" in msg or "cd" in msg.lower():
+    if "冷却" in msg or "cd" in msg.lower() or "already" in msg.lower():
         msg = "今日已抽奖完成"
     return None, msg

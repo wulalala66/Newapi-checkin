@@ -316,3 +316,150 @@ class CloudflareBypasser:
             return f"{parsed.scheme}://{masked_domain}"
         except Exception:
             return 'https://***'
+
+    def bypass_and_gwent(self, timeout: int = 90) -> Optional[dict]:
+        """
+        在同一个 Playwright 会话中完成 CF 绕过 + 维云翻卡(/api/gwent/draw)
+
+        翻卡接口 /api/gwent/* 是 CF 路径级拦截,requests 直连必 403,
+        必须在浏览器会话内执行 fetch 才能携带有效的 cf_clearance 指纹。
+
+        Returns:
+            翻卡结果 dict(含 prize / remaining),或在无次数时返回 {"empty": True}
+        """
+        if not self._playwright_available:
+            print('[CF 翻卡] Playwright 未安装,无法绕过 Cloudflare')
+            return None
+
+        print(f'[CF 翻卡] 使用 Playwright 访问 {self._mask_url(self.base_url)}...')
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            browser = None
+            try:
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=[
+                        '--disable-blink-features=AutomationControlled',
+                        '--no-sandbox',
+                        '--disable-dev-shm-usage',
+                    ]
+                )
+
+                context = browser.new_context(
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
+                    viewport={'width': 1920, 'height': 1080},
+                    locale='zh-CN',
+                )
+
+                context.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                    window.chrome = { runtime: {} };
+                    Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+                    Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en']});
+                """)
+
+                if self.session_cookie:
+                    domain = self.base_url.replace('https://', '').replace('http://', '').split('/')[0]
+                    context.add_cookies([
+                        {'name': 'session', 'value': self.session_cookie, 'domain': domain, 'path': '/'}
+                    ])
+                if self.user_id:
+                    context.add_cookies([
+                        {'name': 'New-Api-User', 'value': str(self.user_id), 'domain': domain, 'path': '/'}
+                    ])
+
+                page = context.new_page()
+                # 先导航翻卡状态接口:触发该路径的 CF 挑战并等待自动通过
+                # (vsllm.cc 对 /api/gwent/* 与 /api/user/checkin 是路径级 WAF 挑战,
+                #  根路径通过不代表 API 路径放行;必须先 goto 该路径过挑战)
+                api_path = '/api/gwent/status'
+                try:
+                    page.goto(self.base_url + api_path, wait_until='domcontentloaded', timeout=timeout * 1000)
+                except Exception:
+                    pass
+                # 等待挑战完成:轮询直到页面出现 JSON 或标题非挑战
+                for _ in range(8):
+                    try:
+                        title = page.title()
+                        body = page.evaluate("document.body ? document.body.innerText.slice(0,120) : ''")
+                    except Exception:
+                        title, body = '', ''
+                    if body.strip().startswith('{') or ('Just a moment' not in title and '安全验证' not in body):
+                        break
+                    time.sleep(5)
+
+                cf_solved = self._solve_cf_challenge(page, max_attempts=4, wait_seconds=5)
+                if not cf_solved:
+                    print('[CF 翻卡] CF 路径挑战未通过,继续尝试翻卡接口...')
+
+                auth_headers = self._build_auth_headers()
+
+                result = page.evaluate('''async (extraHeaders) => {
+                    const post = async (path) => {
+                        const resp = await fetch(path, {
+                            method: 'POST',
+                            headers: Object.assign({'Content-Type': 'application/json'}, extraHeaders),
+                            credentials: 'include'
+                        });
+                        const text = await resp.text();
+                        try { return {json: JSON.parse(text), status: resp.status}; }
+                        catch (e) { return {notJson: true, status: resp.status, text: text.substring(0, 200)}; }
+                    };
+                    // 第一步: 查询翻卡状态(判断剩余次数)
+                    try {
+                        const stResp = await fetch('/api/gwent/status', {
+                            headers: Object.assign({'Accept': 'application/json'}, extraHeaders),
+                            credentials: 'include'
+                        });
+                        const stJson = await stResp.json();
+                        if (!stJson.success) {
+                            return { error: '获取翻卡状态失败: ' + (stJson.message || stResp.status), success: false };
+                        }
+                        const stData = stJson.data || {};
+                        const charge = Number(stData.charges_current || 0);
+                        const extra = Number(stData.extra_draws_left || 0);
+                        if ((charge + extra) <= 0) {
+                            return { empty: true, charges: charge, extra: extra, success: true };
+                        }
+                    } catch (e) {
+                        // 状态查询失败不阻塞翻卡尝试
+                    }
+                    // 第二步: 翻卡
+                    const res = await post('/api/gwent/draw');
+                    if (res.notJson) {
+                        if (res.text.includes('Just a moment') || res.text.includes('安全验证')) {
+                            return { error: 'CF 拦截翻卡接口', httpStatus: res.status, success: false };
+                        }
+                        return { error: '响应非 JSON: ' + res.text, httpStatus: res.status, success: false };
+                    }
+                    const data = res.json;
+                    if (data.success !== true) {
+                        const msg = data.message || data.msg || '翻卡失败';
+                        return { success: false, message: msg, httpStatus: res.status };
+                    }
+                    const d = data.data || {};
+                    const prize = d.prize || {};
+                    const charge = Number(d.charges_current || 0);
+                    const extra = Number(d.extra_draws_left || 0);
+                    return {
+                        success: true,
+                        prize_name: prize.name || '?',
+                        quota_awarded: prize.quota || 0,
+                        remaining: charge + extra,
+                        raw: d
+                    };
+                }''', auth_headers)
+
+                browser.close()
+                browser = None
+                return result
+
+            except Exception as e:
+                print(f'[CF 翻卡] Playwright 执行失败: {e}')
+                try:
+                    if browser:
+                        browser.close()
+                except Exception:
+                    pass
+                return None
