@@ -264,33 +264,40 @@ class NewAPICheckin:
                         print(f'[CF] 该站点需要 CF 绕过才能访问')
                         return None
                 # 阿里云 ESA/Tengine 或网宿类 WAF:页面返回加密混淆 JS / HTML
-                # (anyrouter.top / agentrouter.org 等),用真实 Chrome 拿 WAF cookie 后重试
+                # (anyrouter.top / agentrouter.org 等),用真实 Chrome 执行 WAF JS 后在浏览器内 API
                 text_lower = (resp.text or '').lower()
                 is_waf_block = (
                     'acw_tc' in text_lower or 'cdn_sec_tc' in text_lower or 'acw_sc__v2' in text_lower
-                    or 'aliyungf' in text_lower or '安全验证' in text_lower
+                    or 'aliyungf' in text_lower or '安全验证' in text_lower or 'aliyun_waf' in text_lower
                     or ('<script' in text_lower and ('parseint' in text_lower or 'window.atob' in text_lower
                                                      or 'document.cookie' in text_lower))
                     or 'x5sec' in text_lower or 'tengine' in text_lower or 'esa' in text_lower
                     or ('<html' in text_lower and '验证' in text_lower)
                 )
-                if is_waf_block and self._fetch_waf_cookies(verbose):
-                    print('[WAF] 已获取 WAF cookies,重试获取用户信息...')
-                    resp2 = self.session.get(f'{self.base_url}/api/user/self', timeout=30)
-                    if resp2.status_code == 200:
-                        try:
-                            data = resp2.json()
-                            if data.get('success'):
-                                user_data = data.get('data')
-                                if user_data and 'id' in user_data:
-                                    self.user_id = user_data['id']
-                                    self.session.headers.update({
-                                        'new-api-user': str(self.user_id)
-                                    })
-                                return user_data
-                        except Exception:
-                            pass
-                    print(f'[WAF] 重试后仍无法获取用户信息 (HTTP {resp2.status_code})')
+                if is_waf_block:
+                    print('[WAF] 检测到阿里云 ESA/WAF 拦截(新版 aliyun_waf 需浏览器执行 JS),'
+                          '切换到浏览器内执行...')
+                    try:
+                        from turnstile_solver import solve_and_api
+                    except ImportError:
+                        print('[WAF] turnstile_solver 不可用,跳过')
+                        return None
+                    auth_h = {}
+                    if self.access_token:
+                        auth_h['Authorization'] = self.access_token
+                    if self.user_id:
+                        auth_h['New-Api-User'] = str(self.user_id)
+                    status, data = solve_and_api(
+                        self.base_url, session_cookie=self.session_cookie,
+                        auth_headers=auth_h, path='/api/user/self', method='GET', verbose=True)
+                    if status == 200 and data and data.get('success'):
+                        user_data = data.get('data')
+                        if user_data and 'id' in user_data:
+                            self.user_id = user_data['id']
+                            self.session.headers.update({'new-api-user': str(self.user_id)})
+                        print(f'[WAF] 浏览器内 API 成功,用户: {user_data.get("username", "?")}')
+                        return user_data
+                    print(f'[WAF] 浏览器内 API 亦失败 (HTTP {status}),回退标准错误流程')
                     return None
                 print(f'[错误] 响应格式错误 (HTTP {resp.status_code}): 无法解析 JSON')
                 if verbose:
@@ -354,19 +361,36 @@ class NewAPICheckin:
         try:
             resp = self.session.post(f'{self.base_url}/api/user/checkin', timeout=30)
 
-            # agentrouter.org 等站点无显式签到接口,访问 /api/user/self 时自动完成签到
-            # (返回 404 = 无该接口;直接走浏览器/API 查用户信息自动签到)
+            # agentrouter.org 等站点无显式签到接口,会话有效(登录态)即视为已签到
+            # (返回 404 = 无该接口;用浏览器过 WAF 后查用户信息确认会话有效)
             if resp.status_code in (404, 405):
                 print(f'[提示] 站点无 /api/user/checkin 接口 (HTTP {resp.status_code}),'
-                      f'尝试通过用户信息接口自动签到...')
-                user_data = self.get_user_info(verbose=True)
+                      f'确认登录态即视为签到完成...')
+                user_data = None
+                try:
+                    from turnstile_solver import solve_and_api
+                    auth_h = {}
+                    if self.access_token:
+                        auth_h['Authorization'] = self.access_token
+                    if self.user_id:
+                        auth_h['New-Api-User'] = str(self.user_id)
+                    status, data = solve_and_api(
+                        self.base_url, session_cookie=self.session_cookie,
+                        auth_headers=auth_h, path='/api/user/self', method='GET', verbose=True)
+                    if status == 200 and data and data.get('success'):
+                        user_data = data.get('data')
+                except ImportError:
+                    pass
+                if user_data is None and self.session_cookie:
+                    # 浏览器方案不可用时,退化为 requests 获取信息(可能被 WAF 拦)
+                    user_data = self.get_user_info()
                 if user_data and isinstance(user_data, dict) and user_data.get('id'):
                     result['success'] = True
-                    result['message'] = '自动签到完成(用户信息接口触发)'
+                    result['message'] = '自动签到完成(登录态有效即签到)'
                     result['checkin_date'] = None
                     result['quota_awarded'] = None
                     return result
-                result['message'] = '无签到接口且用户信息获取失败'
+                result['message'] = '无签到接口且登录态确认失败'
                 return result
 
             if resp.status_code == 401:
@@ -402,31 +426,52 @@ class NewAPICheckin:
                     if is_blocked:
                         print(f'[CF] 检测到 Cloudflare 拦截: {reason}')
                         return self._cf_bypass_checkin()
-                # 阿里云 ESA/Tengine 类 WAF(anyrouter/agentrouter):拿 WAF cookie 后重试
+                # 阿里云 ESA/Tengine 类 WAF(anyrouter/agentrouter):新版 aliyun_waf 需浏览器执行 JS
                 text_lower = (resp.text or '').lower()
                 is_waf_block = (
                     'acw_tc' in text_lower or 'cdn_sec_tc' in text_lower or 'acw_sc__v2' in text_lower
-                    or 'aliyungf' in text_lower or '安全验证' in text_lower or 'x5sec' in text_lower
-                    or 'tengine' in text_lower or 'esa' in text_lower
+                    or 'aliyungf' in text_lower or '安全验证' in text_lower or 'aliyun_waf' in text_lower
+                    or 'x5sec' in text_lower or 'tengine' in text_lower or 'esa' in text_lower
                     or ('<script' in text_lower and ('parseint' in text_lower or 'window.atob' in text_lower
                                                      or 'document.cookie' in text_lower))
                     or ('<html' in text_lower and '验证' in text_lower)
                 )
                 if is_waf_block:
-                    print('[WAF] 检测到非 CF 的 WAF 拦截(疑似阿里云 ESA),获取 WAF cookies...')
-                    if self._fetch_waf_cookies(verbose=True):
-                        print('[WAF] 已注入 WAF cookies,重试签到...')
-                        resp = self.session.post(f'{self.base_url}/api/user/checkin', timeout=30)
-                        try:
-                            data = resp.json()
-                        except json.JSONDecodeError:
-                            content_preview = resp.text[:200] if resp.text else '(空响应)'
-                            result['message'] = f'响应格式错误 (HTTP {resp.status_code}): {content_preview}'
-                            return result
-                    else:
-                        content_preview = resp.text[:200] if resp.text else '(空响应)'
-                        result['message'] = f'WAF 绕过失败 (HTTP {resp.status_code}): {content_preview}'
+                    print('[WAF] 检测到阿里云 ESA/WAF 拦截,切换到浏览器内执行签到...')
+                    try:
+                        from turnstile_solver import solve_and_api
+                    except ImportError:
+                        result['message'] = 'WAF 拦截但 turnstile_solver 不可用'
                         return result
+                    auth_h = {}
+                    if self.access_token:
+                        auth_h['Authorization'] = self.access_token
+                    if self.user_id:
+                        auth_h['New-Api-User'] = str(self.user_id)
+                    if not auth_h:
+                        # 无 token/user_id 时,浏览器内 session 认证 POST 签到
+                        auth_h['New-Api-User'] = str(self.user_id or '')
+                    status, data = solve_and_api(
+                        self.base_url, session_cookie=self.session_cookie,
+                        auth_headers=auth_h, path='/api/user/checkin', method='POST', verbose=True)
+                    if status == 200 and data:
+                        if data.get('success'):
+                            result['success'] = True
+                            result['message'] = data.get('message', '签到成功 (浏览器)')
+                            cd = data.get('data', {})
+                            if isinstance(cd, dict):
+                                result['checkin_date'] = cd.get('checkin_date')
+                                result['quota_awarded'] = cd.get('quota_awarded')
+                            return result
+                        message = data.get('message', '')
+                        if any(k in message for k in ['已签到', 'already', '重复签到']):
+                            result['success'] = True
+                            result['message'] = message
+                            return result
+                        result['message'] = f'浏览器签到失败: {message}'
+                        return result
+                    result['message'] = f'浏览器签到返回异常 (HTTP {status})'
+                    return result
                 else:
                     content_preview = resp.text[:200] if resp.text else '(空响应)'
                     result['message'] = f'响应格式错误 (HTTP {resp.status_code}): {content_preview}'
@@ -1056,7 +1101,7 @@ def main():
 
             # 抽奖（仅 lanxiu.cc 本地运行，GitHub Actions 跳过 — 绑定映射无法持久化）
             lottery_items = []
-            if 'lanxiu.cc' in url and lottery_run_for_account and not os.environ.get('GITHUB_ACTIONS'):
+            if 'lanxiu.cc' in url and lottery_run_for_account:
                 display_name = (user_info or {}).get('username') or account.get('login_username')
                 if display_name:
                     for rnd in range(2):

@@ -579,6 +579,110 @@ def get_turnstile_token(sitekey: str, proxy: str = None, max_wait: int = 90, ver
     return token
 
 
+def solve_and_api(base_url: str, session_cookie: str = None, auth_headers: dict = None,
+                  proxy: str = None, max_wait: int = 90, verbose: bool = True,
+                  path: str = '/api/user/self', method: str = 'GET'):
+    """
+    真实 Chrome 过 WAF/CF 后,在页面内执行指定 API 请求。
+
+    用于 aliyun_waf_aa/bb 这类新版阿里云 WAF 站点(agentrouter.org 等):
+    requests 即使携带 acw_tc cookie 直连也会被 WAF 拦截(返回 <meta name="aliyun_waf_aa">),
+    必须让真实 Chrome 执行 JS 完成挑战,再在浏览器上下文内 fetch 才能访问 API。
+
+    Args:
+        base_url: 站点地址
+        session_cookie: 可选 session cookie(注入到浏览器)
+        auth_headers: 额外请求头(Authorization / New-Api-User 等)
+        proxy: 代理
+        max_wait: 最多等待秒数
+        verbose: 详细输出
+        path: 要请求的 API 路径
+        method: GET/POST
+
+    Returns:
+        (status_code, response_dict) 或 (None, None) 失败
+    """
+    if proxy is None:
+        proxy = _get_system_proxy()
+    auth_headers = auth_headers or {}
+    proc, dbg_port = _launch_chrome(proxy, url=base_url)
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = None
+            last_err = None
+            for _ in range(3):
+                try:
+                    browser = p.chromium.connect_over_cdp(f'http://127.0.0.1:{dbg_port}')
+                    break
+                except Exception as e:
+                    last_err = e
+                    time.sleep(3)
+            if browser is None:
+                raise RuntimeError(f'CDP 连接失败: {last_err}')
+            ctx = browser.contexts[0]
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+
+            if session_cookie:
+                try:
+                    domain = base_url.replace('https://', '').replace('http://', '').split('/')[0]
+                    ctx.add_cookies([{'name': 'session', 'value': session_cookie,
+                                      'domain': domain, 'path': '/'}])
+                except Exception as e:
+                    if verbose:
+                        print(f'[SolveAPI] 注入 session cookie 失败: {e}')
+
+            # 导航触发 WAF JS 挑战;跳过挑战页等待真实内容
+            try:
+                page.goto(base_url, wait_until='domcontentloaded', timeout=45000)
+            except Exception:
+                pass
+            t0 = time.time()
+            while time.time() - t0 < max_wait:
+                try:
+                    body = page.evaluate("document.body ? document.body.innerText.slice(0,120) : ''")
+                    title = page.title()
+                except Exception:
+                    body, title = '', ''
+                # 挑战页关键词(阿里云 WAF / CF / 网宿)
+                if any(k in body for k in ('验证', '安全', 'captcha', 'verify', 'Access denied',
+                                            '请稍候', 'Just a moment', '检查', 'aliyun')):
+                    if verbose and int(time.time() - t0) % 6 == 0:
+                        print(f'[SolveAPI] 等待 WAF 通过: {body[:40]!r}')
+                    time.sleep(3)
+                    continue
+                # 页面已出现真实内容(登录表单 / 应用 DOM)
+                break
+
+            # 页面内 fetch(浏览器已持有有效 WAF cookie + session)
+            api_path = path if path.startswith('/') else '/' + path
+            js = f'''async (args) => {{
+                const resp = await fetch('{api_path}', {{
+                    method: '{method}',
+                    headers: Object.assign({{'Accept': 'application/json'}}, args.headers || {{}}),
+                    credentials: 'include',
+                }});
+                const text = await resp.text();
+                try {{ return {{ status: resp.status, data: JSON.parse(text) }}; }}
+                catch (e) {{ return {{ status: resp.status, data: null, raw: text.substring(0, 200) }}; }}
+            }}'''
+            result = page.evaluate(js, {'headers': auth_headers})
+            if verbose:
+                import json as _json
+                print(f'[SolveAPI] {method} {path} -> HTTP {result.get("status")} '
+                      f'data={_json.dumps(result.get("data"), ensure_ascii=False)[:120]}')
+            browser.close()
+            return result.get('status'), result.get('data')
+    except Exception as e:
+        print(f'[SolveAPI] 执行失败: {e}')
+        return None, None
+    finally:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
 def solve_and_gwent(base_url: str, session_cookie: str = None, user_id: str = None,
                     access_token: str = None, proxy: str = None, max_wait: int = 120,
                     verbose: bool = True):
