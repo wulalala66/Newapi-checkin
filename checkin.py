@@ -171,6 +171,38 @@ class NewAPICheckin:
             print(f'  [登录] 登录请求异常: {e}')
             return False
 
+    def _fetch_waf_cookies(self, verbose: bool = False) -> bool:
+        """
+        获取并注入阿里云 ESA/Tengine WAF cookies(acw_tc/cdn_sec_tc/acw_sc__v2)。
+
+        用于 anyrouter.top / agentrouter.org 等站点:requests 直连返回加密混淆 JS,
+        必须先让真实 Chrome 执行页面 JS 拿到 WAF cookie,再携带它们访问 API。
+        agentrouter.org 无显式签到接口,访问 /api/user/self 即自动签到。
+
+        Returns:
+            True 表示注入成功(至少拿到一个 WAF cookie),False 表示失败
+        """
+        if not self.access_token:
+            try:
+                from turnstile_solver import get_waf_cookies
+            except ImportError:
+                if verbose:
+                    print('[WAF] turnstile_solver 不可用')
+                return False
+            if verbose:
+                print('[WAF] 尝试浏览器获取 WAF cookies...')
+            waf = get_waf_cookies(self.base_url, session_cookie=self.session_cookie, verbose=verbose)
+            if waf:
+                for k, v in waf.items():
+                    self.session.cookies.set(k, v)
+                if verbose:
+                    print(f'[WAF] 已注入 cookies: {list(waf.keys())}')
+                return True
+            if verbose:
+                print('[WAF] 未能获取 WAF cookies')
+            return False
+        return True  # 有 access_token 视为自带认证,无需 WAF cookie
+
     def get_user_info(self, verbose: bool = False) -> Optional[dict]:
         """
         获取用户信息
@@ -230,6 +262,35 @@ class NewAPICheckin:
                         print(f'[CF] 获取用户信息时检测到 Cloudflare 拦截: {reason}')
                         print(f'[CF] 该站点需要 CF 绕过才能访问')
                         return None
+                # 阿里云 ESA/Tengine 或网宿类 WAF:页面返回加密混淆 JS / HTML
+                # (anyrouter.top / agentrouter.org 等),用真实 Chrome 拿 WAF cookie 后重试
+                text_lower = (resp.text or '').lower()
+                is_waf_block = (
+                    'acw_tc' in text_lower or 'cdn_sec_tc' in text_lower or 'acw_sc__v2' in text_lower
+                    or 'aliyungf' in text_lower or '安全验证' in text_lower
+                    or ('<script' in text_lower and ('parseint' in text_lower or 'window.atob' in text_lower
+                                                     or 'document.cookie' in text_lower))
+                    or 'x5sec' in text_lower or 'tengine' in text_lower or 'esa' in text_lower
+                    or ('<html' in text_lower and '验证' in text_lower)
+                )
+                if is_waf_block and self._fetch_waf_cookies(verbose):
+                    print('[WAF] 已获取 WAF cookies,重试获取用户信息...')
+                    resp2 = self.session.get(f'{self.base_url}/api/user/self', timeout=30)
+                    if resp2.status_code == 200:
+                        try:
+                            data = resp2.json()
+                            if data.get('success'):
+                                user_data = data.get('data')
+                                if user_data and 'id' in user_data:
+                                    self.user_id = user_data['id']
+                                    self.session.headers.update({
+                                        'new-api-user': str(self.user_id)
+                                    })
+                                return user_data
+                        except Exception:
+                            pass
+                    print(f'[WAF] 重试后仍无法获取用户信息 (HTTP {resp2.status_code})')
+                    return None
                 print(f'[错误] 响应格式错误 (HTTP {resp.status_code}): 无法解析 JSON')
                 if verbose:
                     print(f'  [调试] 原始响应: {resp.text[:500]}')
@@ -292,6 +353,21 @@ class NewAPICheckin:
         try:
             resp = self.session.post(f'{self.base_url}/api/user/checkin', timeout=30)
 
+            # agentrouter.org 等站点无显式签到接口,访问 /api/user/self 时自动完成签到
+            # (返回 404 = 无该接口;直接走浏览器/API 查用户信息自动签到)
+            if resp.status_code in (404, 405):
+                print(f'[提示] 站点无 /api/user/checkin 接口 (HTTP {resp.status_code}),'
+                      f'尝试通过用户信息接口自动签到...')
+                user_data = self.get_user_info(verbose=True)
+                if user_data and isinstance(user_data, dict) and user_data.get('id'):
+                    result['success'] = True
+                    result['message'] = '自动签到完成(用户信息接口触发)'
+                    result['checkin_date'] = None
+                    result['quota_awarded'] = None
+                    return result
+                result['message'] = '无签到接口且用户信息获取失败'
+                return result
+
             if resp.status_code == 401:
                 result['message'] = '认证失败: Session 可能已过期，请重新获取'
                 # 尝试自动登录
@@ -325,9 +401,35 @@ class NewAPICheckin:
                     if is_blocked:
                         print(f'[CF] 检测到 Cloudflare 拦截: {reason}')
                         return self._cf_bypass_checkin()
-                content_preview = resp.text[:200] if resp.text else '(空响应)'
-                result['message'] = f'响应格式错误 (HTTP {resp.status_code}): {content_preview}'
-                return result
+                # 阿里云 ESA/Tengine 类 WAF(anyrouter/agentrouter):拿 WAF cookie 后重试
+                text_lower = (resp.text or '').lower()
+                is_waf_block = (
+                    'acw_tc' in text_lower or 'cdn_sec_tc' in text_lower or 'acw_sc__v2' in text_lower
+                    or 'aliyungf' in text_lower or '安全验证' in text_lower or 'x5sec' in text_lower
+                    or 'tengine' in text_lower or 'esa' in text_lower
+                    or ('<script' in text_lower and ('parseint' in text_lower or 'window.atob' in text_lower
+                                                     or 'document.cookie' in text_lower))
+                    or ('<html' in text_lower and '验证' in text_lower)
+                )
+                if is_waf_block:
+                    print('[WAF] 检测到非 CF 的 WAF 拦截(疑似阿里云 ESA),获取 WAF cookies...')
+                    if self._fetch_waf_cookies(verbose=True):
+                        print('[WAF] 已注入 WAF cookies,重试签到...')
+                        resp = self.session.post(f'{self.base_url}/api/user/checkin', timeout=30)
+                        try:
+                            data = resp.json()
+                        except json.JSONDecodeError:
+                            content_preview = resp.text[:200] if resp.text else '(空响应)'
+                            result['message'] = f'响应格式错误 (HTTP {resp.status_code}): {content_preview}'
+                            return result
+                    else:
+                        content_preview = resp.text[:200] if resp.text else '(空响应)'
+                        result['message'] = f'WAF 绕过失败 (HTTP {resp.status_code}): {content_preview}'
+                        return result
+                else:
+                    content_preview = resp.text[:200] if resp.text else '(空响应)'
+                    result['message'] = f'响应格式错误 (HTTP {resp.status_code}): {content_preview}'
+                    return result
 
             if detect_cloudflare_block and resp.status_code in (403, 503):
                 is_blocked, reason = detect_cloudflare_block(resp.status_code, json.dumps(data))

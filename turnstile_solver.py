@@ -430,6 +430,113 @@ def solve_and_checkin(base_url: str, sitekey: str = None, auth_headers: dict = N
             pass
 
 
+def get_waf_cookies(base_url: str, session_cookie: str = None, proxy: str = None,
+                    max_wait: int = 90, verbose: bool = True):
+    """
+    使用真实 Chrome 访问站点,执行 JS 通过 WAF(阿里云 ESA/Tengine acw_tc /
+    cdn_sec_tc / acw_sc__v2 或网宿类反爬),提取 WAF cookie 字典。
+
+    anyrouter.top / agentrouter.org 等站点启用阿里云 ESA(Tengine)防护:
+    requests 直连返回加密混淆 JS 或 HTML,必须先让真实浏览器执行页面 JS
+    获得 acw_tc 等 cookie,再用携带这些 cookie 的请求访问 API。
+
+    Args:
+        base_url: 站点地址
+        session_cookie: 可选,同时注入 session cookie
+        proxy: 代理地址
+        max_wait: 最大等待秒数
+        verbose: 详细输出
+
+    Returns:
+        {"acw_tc": "...", "cdn_sec_tc": "...", ...} 或 None(失败)
+    """
+    if proxy is None:
+        proxy = _get_system_proxy()
+    proc, dbg_port = _launch_chrome(proxy, url=base_url)
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = None
+            last_err = None
+            for _ in range(3):
+                try:
+                    browser = p.chromium.connect_over_cdp(f'http://127.0.0.1:{dbg_port}')
+                    break
+                except Exception as e:
+                    last_err = e
+                    time.sleep(3)
+            if browser is None:
+                raise RuntimeError(f'CDP 连接失败: {last_err}')
+            ctx = browser.contexts[0]
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+
+            if session_cookie:
+                try:
+                    domain = base_url.replace('https://', '').replace('http://', '').split('/')[0]
+                    ctx.add_cookies([{'name': 'session', 'value': session_cookie,
+                                      'domain': domain, 'path': '/'}])
+                except Exception:
+                    pass
+
+            # 导航首页触发 WAF JS(阿里云会 302/set-cookie acw_tc 系列)
+            if verbose:
+                print(f'[WAF] 导航 {base_url} 执行阿里云 ESA JS...')
+            try:
+                page.goto(base_url, wait_until='domcontentloaded', timeout=45000)
+            except Exception:
+                pass
+
+            # 等待页面 JS 完成(阿里云挑战页会自动跳转;最多 max_wait 秒)
+            t0 = time.time()
+            while time.time() - t0 < max_wait:
+                try:
+                    title = page.title()
+                    body = page.evaluate("document.body ? document.body.innerText.slice(0,80) : ''")
+                except Exception:
+                    title, body = '', ''
+                # 阿里云挑战页相关关键词
+                if any(k in body for k in ('验证', 'captcha', '安全', 'verify', 'Access denied',
+                                            '请稍候', 'Just a moment', '检查')):
+                    if verbose and int(time.time() - t0) % 6 == 0:
+                        print(f'[WAF] 等待 JS 通过: {body[:40]!r}')
+                    time.sleep(3)
+                    continue
+                # 页面已渲染出真实内容(标题/正文不再是挑战页)
+                break
+
+            # 提取 WAF cookie
+            cookies = ctx.cookies()
+            waf_cookies = {}
+            for c in cookies:
+                name = c.get('name', '')
+                value = c.get('value', '') or ''
+                if name in ('acw_tc', 'cdn_sec_tc', 'acw_sc__v2', 'aliyungf_tc', '__jsluid_s',
+                            '_tengate_acw_tc', 'x5sec'):
+                    waf_cookies[name] = value
+                if name == 'session' and session_cookie:
+                    waf_cookies['session'] = value
+            ses_cookies = [c for c in cookies if c.get('name') == 'session']
+            if session_cookie and not ses_cookies:
+                # 注入的 session 也加进去(CDP cookie 可能未回显)
+                waf_cookies['session'] = session_cookie
+
+            if verbose:
+                if waf_cookies:
+                    print(f'[WAF] 获取到 cookies: {list(waf_cookies.keys())}')
+                else:
+                    print('[WAF] 未获取到 WAF cookies(可能该站无 ESA 防护或挑战未通过)')
+            browser.close()
+            return waf_cookies if waf_cookies else None
+    except Exception as e:
+        print(f'[WAF] 获取 WAF cookies 失败: {e}')
+        return None
+    finally:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
 def get_turnstile_token(sitekey: str, proxy: str = None, max_wait: int = 90, verbose: bool = True):
     """本地页面渲染 Turnstile 组件并自动点击，返回 token（调试用）"""
     if proxy is None:
