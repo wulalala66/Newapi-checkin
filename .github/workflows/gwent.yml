@@ -1,16 +1,12 @@
-name: 维云翻卡 (每小时)
+name: 维云翻卡 (每6小时)
 
 on:
-  # 每小时整点检查翻卡;无次数时脚本自动秒退,不浪费资源
+  # 每 6 小时检查翻卡(charges_max=2, 使用后 7200s 恢复 1 格;翻卡有每日次数上限,
+  # 低频定时即可吃满机会,且不会因 GitHub schedule 频率限制被跳过)
   schedule:
-    - cron: '0 * * * *'
+    - cron: '0 */6 * * *'
   # 手动触发
   workflow_dispatch:
-
-# 防止排队:同一时间只允许一个 run,新的触发会跳过而非排队(避免挤掉后续定时)
-concurrency:
-  group: gwent
-  cancel-in-progress: false
 
 jobs:
   gwent:
@@ -37,7 +33,7 @@ jobs:
           google-chrome --version || true
           which xvfb-run || sudo apt-get install -y xvfb || true
 
-      - name: 执行翻卡 (xvfb 虚拟显示,浏览器内过 CF 翻 gwent)
+      - name: 执行翻卡 (浏览器内过 CF 翻 gwent)
         env:
           CONFIG_URL: ${{ secrets.CONFIG_URL }}
           CONFIG_AUTH: ${{ secrets.CONFIG_AUTH }}
