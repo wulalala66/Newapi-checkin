@@ -703,6 +703,7 @@ def solve_and_api(base_url: str, session_cookie: str = None, auth_headers: dict 
             # 页面内 fetch(浏览器已持有有效 WAF cookie + session;补全浏览器行为头绕过
             # 阿里云 WAF 对 API 请求的二次校验)
             api_path = path if path.startswith('/') else '/' + path
+            # fetch 带指数退避:挑战 JS 种 cookie 需要时间,首次 403/HTML 后间隔重试
             js = f'''async (args) => {{
                 const h = Object.assign({{
                     'Accept': 'application/json, text/plain, */*',
@@ -714,14 +715,28 @@ def solve_and_api(base_url: str, session_cookie: str = None, auth_headers: dict 
                     'Sec-Fetch-Mode': 'cors',
                     'Sec-Fetch-Site': 'same-origin',
                 }}, args.headers || {{}});
-                const resp = await fetch('{api_path}', {{
-                    method: '{method}',
-                    headers: h,
-                    credentials: 'include',
-                }});
-                const text = await resp.text();
-                try {{ return {{ status: resp.status, data: JSON.parse(text) }}; }}
-                catch (e) {{ return {{ status: resp.status, data: null, raw: text.substring(0, 300) }}; }}
+                const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+                let last = {{ status: 0, data: null, raw: 'no-request' }};
+                for (let attempt = 0; attempt < 5; attempt++) {{
+                    if (attempt > 0) await sleep(2500 * attempt + 1500);
+                    try {{
+                        const resp = await fetch('{api_path}', {{
+                            method: '{method}',
+                            headers: h,
+                            credentials: 'include',
+                        }});
+                        const text = await resp.text();
+                        try {{ last = {{ status: resp.status, data: JSON.parse(text) }}; }}
+                        catch (e) {{ last = {{ status: resp.status, data: null, raw: text.substring(0, 300) }}; }}
+                        // 成功或非 WAF HTML 即停
+                        const isWaf = (last.raw && (last.raw.includes('aliyun_waf') || last.raw.includes('Just a moment')
+                            || last.raw.includes('安全验证') || last.raw.toLowerCase().includes('<!doctype')));
+                        if (last.data !== null || !isWaf) return last;
+                    }} catch (e) {{
+                        last = {{ status: 0, data: null, raw: 'fetch-error: ' + e.message }};
+                    }}
+                }}
+                return last;
             }}'''
             result = page.evaluate(js, {'headers': auth_headers})
             # 若返回的是 WAF HTML(非 JSON),reload 后等 WAF JS 跑完再试
