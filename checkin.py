@@ -838,14 +838,26 @@ def main():
             err = None
             drawn_items = []
             for rnd in range(3):
-                if CloudflareBypasser is None:
-                    err = 'CloudflareBypasser 未导入'
-                    break
-                bypasser = CloudflareBypasser(url, session_cookie, user_id, access_token)
-                if not bypasser.is_available():
-                    err = 'Playwright 未安装'
-                    break
-                browser_result = bypasser.bypass_and_gwent()
+                browser_result = None
+                err = None
+                # 方案1: 真实 Chrome + CDP + Turnstile 坐标点击(turnstile_solver,过 CF 成功率最高)
+                try:
+                    from turnstile_solver import solve_and_gwent
+                    print(f'  翻卡: 使用真实 Chrome 过 CF...')
+                    browser_result = solve_and_gwent(url, session_cookie=session_cookie,
+                                                     user_id=user_id, access_token=access_token)
+                except Exception as e:
+                    print(f'  翻卡: turnstile_solver 不可用({e}),回退 playwright')
+                    browser_result = None
+                # 方案2: playwright 直接启动(cf_bypass,作为兜底)
+                if browser_result is None and CloudflareBypasser is not None:
+                    try:
+                        bypasser = CloudflareBypasser(url, session_cookie, user_id, access_token)
+                        if bypasser.is_available():
+                            browser_result = bypasser.bypass_and_gwent()
+                    except Exception as e:
+                        print(f'  翻卡: playwright 回退失败: {e}')
+                        browser_result = None
                 if browser_result is None:
                     err = '浏览器翻卡执行失败'
                     break
@@ -870,11 +882,15 @@ def main():
             if drew:
                 success_count += 1
             else:
-                fail_count += 1
+                # "今日已无翻卡次数"是正常状态,不算失败
+                if drawn_items and any('无翻卡次数' in d for d in drawn_items):
+                    pass  # 已抽完,视为成功
+                else:
+                    fail_count += 1
             checkin_results.append({
                 'name': name,
-                'success': bool(drew),
-                'message': ('翻卡完成' if drew else (err or '翻卡失败')),
+                'success': bool(drew) or any('无翻卡次数' in d for d in drawn_items),
+                'message': ('翻卡完成' if drew else ('今日已无翻卡次数' if any('无翻卡次数' in d for d in drawn_items) else (err or '翻卡失败'))),
                 'lottery': drawn_items,
             })
             print()

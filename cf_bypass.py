@@ -85,19 +85,28 @@ class CloudflareBypasser:
         """
         解决 CF 验证挑战
         """
+        # CF 挑战页的常见标题/正文关键词(含中文)
+        challenge_keywords = (
+            'Just a moment', 'Checking your browser', 'Attention Required',
+            'Performing security verification', 'challenge-platform',
+            '请稍候', '正在进行安全验证', '安全服务防护恶意',
+        )
         for attempt in range(max_attempts):
-            title = page.title()
-            current_url = page.url
-            print(f'[CF 绕过] 检查 CF 验证状态 (尝试 {attempt + 1}/{max_attempts}): Title="{title[:50]}"')
+            title, body = '', ''
+            try:
+                title = page.title()
+            except Exception:
+                pass
+            try:
+                body = page.evaluate("document.body ? document.body.innerText.slice(0,200) : ''")
+            except Exception:
+                pass
+            print(f'[CF 绕过] 检查 CF 验证状态 (尝试 {attempt + 1}/{max_attempts}): Title="{title[:50]}" body="{body[:40]}"')
 
-            is_cf_challenge = (
-                'Just a moment' in title or
-                'Checking your browser' in title or
-                'Attention Required' in title or
-                'cloudflare' in title.lower() and 'challenge' in title.lower()
-            )
+            is_cf_challenge = any(k in title for k in challenge_keywords) or any(k in body for k in challenge_keywords)
 
             if not is_cf_challenge:
+                # 挑战已通过: 标题/正文都不再是挑战页
                 print(f'[CF 绕过] CF 验证已通过: Title="{title}"')
                 return True
 
@@ -108,13 +117,12 @@ class CloudflareBypasser:
                 pass
             time.sleep(wait_seconds)
 
-        title = page.title()
-        is_cf_challenge = (
-            'Just a moment' in title or
-            'Checking your browser' in title or
-            'Attention Required' in title or
-            'cloudflare' in title.lower() and 'challenge' in title.lower()
-        )
+        try:
+            title = page.title()
+            body = page.evaluate("document.body ? document.body.innerText.slice(0,200) : ''")
+        except Exception:
+            title, body = '', ''
+        is_cf_challenge = any(k in title for k in challenge_keywords) or any(k in body for k in challenge_keywords)
         if not is_cf_challenge:
             print(f'[CF 绕过] CF 验证已通过: Title="{title}"')
             return True
@@ -334,15 +342,21 @@ class CloudflareBypasser:
         print(f'[CF 翻卡] 使用 Playwright 访问 {self._mask_url(self.base_url)}...')
         from playwright.sync_api import sync_playwright
 
+        # 优先有头模式(xvfb 环境),CF 对 headless 检测更严格;
+        # 设置 CF_HEADLESS=1 可强制无头
+        import os as _os
+        headless = _os.environ.get('CF_HEADLESS', '').strip() == '1'
+
         with sync_playwright() as p:
             browser = None
             try:
                 browser = p.chromium.launch(
-                    headless=True,
+                    headless=headless,
                     args=[
                         '--disable-blink-features=AutomationControlled',
                         '--no-sandbox',
                         '--disable-dev-shm-usage',
+                        '--window-size=1920,1080',
                     ]
                 )
 
@@ -379,19 +393,38 @@ class CloudflareBypasser:
                 except Exception:
                     pass
                 # 等待挑战完成:轮询直到页面出现 JSON 或标题非挑战
-                for _ in range(8):
+                # 若停留在"请稍候/安全验证"挑战页,自动 reload 重试
+                env_check = _os.environ.get('CF_GWENT_MAXWAIT', '60')
+                try:
+                    max_wait = int(env_check)
+                except ValueError:
+                    max_wait = 60
+                t0 = time.time()
+                passed = False
+                while time.time() - t0 < max_wait:
                     try:
                         title = page.title()
-                        body = page.evaluate("document.body ? document.body.innerText.slice(0,120) : ''")
+                        body = page.evaluate("document.body ? document.body.innerText.slice(0,150) : ''")
                     except Exception:
                         title, body = '', ''
-                    if body.strip().startswith('{') or ('Just a moment' not in title and '安全验证' not in body):
+                    # 通过条件: 返回 JSON 数据
+                    if body.strip().startswith('{'):
+                        passed = True
+                        print('[CF 翻卡] 路径挑战已通过(返回 JSON)')
                         break
-                    time.sleep(5)
+                    # 等待期中间尝试 reload 一次(10s 后),帮助 Turnstile 完成
+                    if time.time() - t0 > 10 and int((time.time() - t0) // 10) % 2 == 1 and not getattr(self, '_reloaded', False):
+                        self._reloaded = True
+                        try:
+                            page.reload(wait_until='domcontentloaded', timeout=20000)
+                        except Exception:
+                            pass
+                    time.sleep(4)
 
-                cf_solved = self._solve_cf_challenge(page, max_attempts=4, wait_seconds=5)
-                if not cf_solved:
-                    print('[CF 翻卡] CF 路径挑战未通过,继续尝试翻卡接口...')
+                if not passed:
+                    cf_solved = self._solve_cf_challenge(page, max_attempts=3, wait_seconds=5)
+                    if not cf_solved:
+                        print('[CF 翻卡] CF 路径挑战未通过,继续尝试翻卡接口...')
 
                 auth_headers = self._build_auth_headers()
 

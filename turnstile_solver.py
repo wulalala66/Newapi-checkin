@@ -416,3 +416,190 @@ def get_turnstile_token(sitekey: str, proxy: str = None, max_wait: int = 90, ver
                 pass
         server.shutdown()
     return token
+
+
+def solve_and_gwent(base_url: str, session_cookie: str = None, user_id: str = None,
+                    access_token: str = None, proxy: str = None, max_wait: int = 120,
+                    verbose: bool = True):
+    """
+    在真实 Chrome 会话内完成 CF 通过 + 维云翻卡(/api/gwent/draw)
+
+    vsllm.cc 对 /api/gwent/* 与 /api/user/checkin 采用路径级 CF 挑战,
+    requests/curl 直连必 403,playwright 直接启动的 Chrome 会因自动化特征被
+    Turnstile 卡死;必须用真实 Chrome + CDP 连接 + 坐标点击勾选框(本仓库方案)。
+
+    Args:
+        base_url: 站点地址
+        session_cookie: session cookie 值
+        user_id: New-Api-User 头
+        access_token: 可选 Authorization 令牌(优先级高于 session)
+        proxy: 代理;默认读系统代理(GHA 无代理为 None)
+        max_wait: 最大等待秒数
+
+    Returns:
+        dict:
+          {"empty": true}                    已无翻卡次数
+          {"success": true, "prize_name", "quota_awarded", "remaining"} 成功
+          {"error": ...}                     失败
+    """
+    if proxy is None:
+        proxy = _get_system_proxy()
+    auth_headers = {}
+    if access_token:
+        auth_headers['Authorization'] = access_token
+    if user_id:
+        auth_headers['New-Api-User'] = str(user_id)
+
+    proc, dbg_port = _launch_chrome(proxy, url=base_url)
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = None
+            last_err = None
+            for _ in range(3):
+                try:
+                    browser = p.chromium.connect_over_cdp(f'http://127.0.0.1:{dbg_port}')
+                    break
+                except Exception as e:
+                    last_err = e
+                    time.sleep(3)
+            if browser is None:
+                raise RuntimeError(f'CDP 连接失败: {last_err}')
+            ctx = browser.contexts[0]
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+
+            # 注入 session cookie(有 user_id 时同时留 New-Api-User 头,但 cookie 更稳)
+            if session_cookie:
+                domain = base_url.replace('https://', '').replace('http://', '').split('/')[0]
+                try:
+                    ctx.add_cookies([{'name': 'session', 'value': session_cookie,
+                                      'domain': domain, 'path': '/'}])
+                except Exception as e:
+                    if verbose:
+                        print(f'[Turnstile] 注入 session cookie 失败: {e}')
+
+            if verbose:
+                print(f'[Turnstile] 导航并等待 CF 通过: {base_url}')
+            if not _wait_cf_pass(page, base_url, timeout=60, verbose=verbose):
+                if verbose:
+                    print('[Turnstile] CF 验证未通过(首页)')
+                return {'error': 'CF 首页挑战未通过'}
+
+            # 翻卡目标路径:先导航触发该路径的 CF 挑战,等返回 JSON 即通过
+            api_path = '/api/gwent/status'
+            try:
+                page.goto(base_url + api_path, wait_until='domcontentloaded', timeout=45000)
+            except Exception:
+                pass
+            t0 = time.time()
+            passed = False
+            while time.time() - t0 < 60:
+                try:
+                    body = page.evaluate("document.body ? document.body.innerText.slice(0,150) : ''")
+                    title = page.title()
+                except Exception:
+                    body, title = '', ''
+                if body.strip().startswith('{'):
+                    passed = True
+                    if verbose:
+                        print('[Turnstile] 翻卡路径挑战已通过')
+                    break
+                # 挑战页可能是中文"请稍候"/"正在进行安全验证"
+                if verbose and int(time.time()) % 8 == 0:
+                    print(f'[Turnstile] 等待路径挑战: title={title[:30]!r} body={body[:30]!r}')
+                if time.time() - t0 > 10:
+                    try:
+                        page.reload(wait_until='domcontentloaded', timeout=20000)
+                    except Exception:
+                        pass
+                    t0_reload = time.time()
+                    # reload 后最多 20s 再看
+                    while time.time() - t0_reload < 20:
+                        try:
+                            body = page.evaluate("document.body ? document.body.innerText.slice(0,150) : ''")
+                        except Exception:
+                            body = ''
+                        if body.strip().startswith('{'):
+                            passed = True
+                            break
+                        time.sleep(3)
+                    if passed:
+                        break
+                else:
+                    time.sleep(4)
+            if not passed:
+                if verbose:
+                    print('[Turnstile] 翻卡路径挑战未通过,尝试直接翻卡')
+            # 尝试 Turnstile 手动勾选(若挑战页内嵌组件)
+            try:
+                sitekey = page.evaluate('''async () => {
+                    try {
+                        const r = await fetch('/api/status');
+                        const j = await r.json();
+                        return (j.data && j.data.turnstile_site_key) || null;
+                    } catch (e) { return null; }
+                }''')
+            except Exception:
+                sitekey = None
+
+            GWENT_JS = '''async (headers, sessionSet) => {
+                const H = Object.assign({'Content-Type': 'application/json'}, headers);
+                const post = async (path, method) => {
+                    const resp = await fetch(path, {
+                        method: method || 'POST',
+                        headers: Object.assign({'Accept': 'application/json'}, headers),
+                        credentials: 'include',
+                    });
+                    const text = await resp.text();
+                    try { return {json: JSON.parse(text), status: resp.status}; }
+                    catch (e) { return {notJson: true, status: resp.status, text: text.substring(0, 150)}; }
+                };
+                // 查询状态
+                try {
+                    const st = await post('/api/gwent/status', 'GET');
+                    if (!st.notJson && st.json && st.json.success !== false) {
+                        const d = st.json.data || {};
+                        const charge = Number(d.charges_current || 0);
+                        const extra = Number(d.extra_draws_left || 0);
+                        if ((charge + extra) <= 0) {
+                            return { empty: true, charges: charge, extra: extra, success: true, status: st.status };
+                        }
+                    }
+                } catch (e) {}
+                // 翻卡
+                const res = await post('/api/gwent/draw', 'POST');
+                if (res.notJson) {
+                    if (res.text.includes('Just a moment') || res.text.includes('安全验证')) {
+                        return { error: 'CF 拦截翻卡接口', httpStatus: res.status, success: false };
+                    }
+                    return { error: '响应非 JSON: ' + res.text, httpStatus: res.status, success: false };
+                }
+                const data = res.json;
+                if (data.success !== true) {
+                    return { success: false, message: data.message || data.msg || '翻卡失败', httpStatus: res.status };
+                }
+                const d = data.data || {};
+                const prize = d.prize || {};
+                return {
+                    success: true,
+                    prize_name: prize.name || '?',
+                    quota_awarded: prize.quota || 0,
+                    remaining: (Number(d.charges_current || 0) + Number(d.extra_draws_left || 0)),
+                    status: res.status
+                };
+            }'''
+
+            result = page.evaluate(GWENT_JS, auth_headers)
+            if verbose:
+                import json as _json
+                print(f'[Turnstile] 翻卡结果: {_json.dumps(result, ensure_ascii=False)[:200]}')
+            browser.close()
+            return result if isinstance(result, dict) else {'error': str(result)}
+    except Exception as e:
+        print(f'[Turnstile] 翻卡求解失败: {e}')
+        return {'error': str(e)}
+    finally:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
