@@ -437,6 +437,14 @@ class NewAPICheckin:
                     or ('<html' in text_lower and '验证' in text_lower)
                 )
                 if is_waf_block:
+                    # agentrouter 等阿里云 WAF 站点在 GHA 数据中心 IP 下需长时间浏览器挑战,
+                    # 会拖慢整个运行(1分钟→20分钟),此处在云端直接快速跳过,不启动浏览器。
+                    # 如需支持,请本地运行(家庭 IP 可直接通过 WAF)或后续用专用方案。
+                    if os.environ.get('GITHUB_ACTIONS'):
+                        print('[WAF] GHA 环境跳过 agentrouter 类站点(避免超时),'
+                              '如需支持请本地运行')
+                        result['message'] = 'WAF 站点(agentrouter)在 GHA 上跳过'
+                        return result
                     print('[WAF] 检测到阿里云 ESA/WAF 拦截,切换到浏览器内执行签到...')
                     try:
                         from turnstile_solver import solve_and_api
