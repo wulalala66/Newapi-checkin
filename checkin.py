@@ -454,8 +454,8 @@ class NewAPICheckin:
             return result
 
         message = resp_data.get('message', '签到失败')
-        already_keywords = ['已签到', '已经签到', 'already', '重复签到']
-        if resp_data.get('success') or any(k in message for k in already_keywords):
+        already_keywords = ['已签到', '已经签到', 'already', '重复签到', 'checked in']
+        if resp_data.get('success') or any(k in str(message).lower() for k in already_keywords):
             result['success'] = True
             result['message'] = f'{message} (Turnstile)'
             checkin_data = resp_data.get('data', {})
