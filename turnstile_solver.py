@@ -724,26 +724,43 @@ def solve_and_api(base_url: str, session_cookie: str = None, auth_headers: dict 
                 catch (e) {{ return {{ status: resp.status, data: null, raw: text.substring(0, 300) }}; }}
             }}'''
             result = page.evaluate(js, {'headers': auth_headers})
-            # 若返回的是 WAF HTML(非 JSON),reload 一次后再试
-            for _retry in range(3):
-                if result.get('data') is not None:
+            # 若返回的是 WAF HTML(非 JSON),reload 后等 WAF JS 跑完再试
+            for _retry in range(4):
+                if result.get('data') is not None and not (isinstance(result.get('data'), dict) and result['data'].get('message', '').startswith('<!')):
                     break
                 raw = result.get('raw', '')
-                if 'aliyun_waf' in raw or 'Just a moment' in raw or '安全验证' in raw or '<!doctype' in raw.lower():
-                    if verbose:
-                        print(f'[SolveAPI] 仍被 WAF 拦截,第 {_retry+1} 次 reload 重试...')
-                    try:
-                        page.reload(wait_until='domcontentloaded', timeout=20000)
-                    except Exception:
-                        pass
-                    time.sleep(6)
-                    result = page.evaluate(js, {'headers': auth_headers})
-                else:
+                dumped = str(result.get('data', ''))
+                is_waf = ('aliyun_waf' in raw or 'Just a moment' in raw or '安全验证' in raw
+                          or '<!doctype' in raw.lower() or '<html' in raw.lower() or 'aliyun_waf' in dumped)
+                if not is_waf:
                     break
+                if verbose:
+                    print(f'[SolveAPI] 仍被 WAF 拦截(第 {_retry+1} 次),reload 后等待 WAF JS...')
+                try:
+                    page.reload(wait_until='domcontentloaded', timeout=20000)
+                except Exception:
+                    pass
+                # 等 WAF JS 完成(检测 acw_sc__v2 等二次 cookie 或页面真实 UI)
+                w2 = time.time()
+                while time.time() - w2 < 25:
+                    try:
+                        cookies_now = ctx.cookies()
+                        has_sec = any(c['name'] in ('acw_sc__v2', 'cdn_sec_tc') for c in cookies_now)
+                        ui = page.evaluate("""() => document.querySelectorAll('input, button, a').length > 0 && (document.body ? document.body.innerText.trim().length > 0 : false)""")
+                    except Exception:
+                        has_sec, ui = False, False
+                    if has_sec and ui:
+                        break
+                    time.sleep(2)
+                result = page.evaluate(js, {'headers': auth_headers})
             if verbose:
                 import json as _json
-                print(f'[SolveAPI] {method} {path} -> HTTP {result.get("status")} '
-                      f'data={_json.dumps(result.get("data"), ensure_ascii=False)[:120]}')
+                if result.get('data') is not None:
+                    print(f'[SolveAPI] {method} {path} -> HTTP {result.get("status")} '
+                          f'data={_json.dumps(result.get("data"), ensure_ascii=False)[:120]}')
+                else:
+                    print(f'[SolveAPI] {method} {path} -> HTTP {result.get("status")} '
+                          f'非JSON raw={result.get("raw", "")[:200]!r}')
             browser.close()
             return result.get('status'), result.get('data')
     except Exception as e:
