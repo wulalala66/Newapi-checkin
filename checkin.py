@@ -439,8 +439,8 @@ class NewAPICheckin:
                 if is_waf_block:
                     # agentrouter 等阿里云 WAF 站点在 GHA 数据中心 IP 下需长时间浏览器挑战,
                     # 会拖慢整个运行(1分钟→20分钟),此处在云端直接快速跳过,不启动浏览器。
-                    # 如需支持,请本地运行(家庭 IP 可直接通过 WAF)或后续用专用方案。
-                    if os.environ.get('GITHUB_ACTIONS'):
+                    # 仅 agentrouter 跳过;anyrouter 等 GET self 可通的站点继续登录态确认。
+                    if os.environ.get('GITHUB_ACTIONS') and 'agentrouter' in self.base_url:
                         print('[WAF] GHA 环境跳过 agentrouter 类站点(避免超时),'
                               '如需支持请本地运行')
                         result['message'] = 'WAF 站点(agentrouter)在 GHA 上跳过'
