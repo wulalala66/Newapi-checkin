@@ -700,12 +700,23 @@ def solve_and_api(base_url: str, session_cookie: str = None, auth_headers: dict 
                     print(f'[SolveAPI] 等待 WAF: title={title[:30]!r} has_ui={has_ui} waf_cookie={has_waf}')
                 time.sleep(3)
 
-            # 页面内 fetch(浏览器已持有有效 WAF cookie + session)
+            # 页面内 fetch(浏览器已持有有效 WAF cookie + session;补全浏览器行为头绕过
+            # 阿里云 WAF 对 API 请求的二次校验)
             api_path = path if path.startswith('/') else '/' + path
             js = f'''async (args) => {{
+                const h = Object.assign({{
+                    'Accept': 'application/json, text/plain, */*',
+                    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'Referer': location.origin + '/',
+                    'Origin': location.origin,
+                    'Sec-Fetch-Dest': 'empty',
+                    'Sec-Fetch-Mode': 'cors',
+                    'Sec-Fetch-Site': 'same-origin',
+                }}, args.headers || {{}});
                 const resp = await fetch('{api_path}', {{
                     method: '{method}',
-                    headers: Object.assign({{'Accept': 'application/json'}}, args.headers || {{}}),
+                    headers: h,
                     credentials: 'include',
                 }});
                 const text = await resp.text();
