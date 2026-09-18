@@ -1,11 +1,16 @@
-name: 维云翻卡 (每2小时)
+name: 维云翻卡 (每小时)
 
 on:
-  # 每天 24 次整点检查翻卡(charges_max=2, 使用后 7200s 恢复 1 格)
+  # 每小时整点检查翻卡;无次数时脚本自动秒退,不浪费资源
   schedule:
-    - cron: '0 */2 * * *'
+    - cron: '0 * * * *'
   # 手动触发
   workflow_dispatch:
+
+# 防止排队:同一时间只允许一个 run,新的触发会跳过而非排队(避免挤掉后续定时)
+concurrency:
+  group: gwent
+  cancel-in-progress: false
 
 jobs:
   gwent:

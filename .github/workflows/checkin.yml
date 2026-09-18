@@ -7,6 +7,11 @@ on:
   # 手动触发
   workflow_dispatch:
 
+# 防止排队：同一时间只允许一个 run，新触发的跳过而非排队堵住定时器
+concurrency:
+  group: checkin
+  cancel-in-progress: false
+
 jobs:
   checkin:
     runs-on: ubuntu-latest
