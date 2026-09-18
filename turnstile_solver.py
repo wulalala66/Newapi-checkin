@@ -623,36 +623,82 @@ def solve_and_api(base_url: str, session_cookie: str = None, auth_headers: dict 
             ctx = browser.contexts[0]
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
+            # 导航到站点(必须先导航到目标域,Cookie 才能写入)
+            try:
+                page.goto(base_url, wait_until='domcontentloaded', timeout=45000)
+            except Exception:
+                pass
+
+            # 用 CDP Network.setCookie 注入 session(比 add_cookies 稳定)
             if session_cookie:
                 try:
                     domain = base_url.replace('https://', '').replace('http://', '').split('/')[0]
-                    ctx.add_cookies([{'name': 'session', 'value': session_cookie,
-                                      'domain': domain, 'path': '/'}])
-                except Exception as e:
+                    cdp = ctx.new_cdp_session(page)
+                    cdp.send('Network.setCookie', {
+                        'name': 'session', 'value': session_cookie,
+                        'domain': domain, 'path': '/',
+                        'url': base_url + '/',
+                    })
                     if verbose:
-                        print(f'[SolveAPI] 注入 session cookie 失败: {e}')
+                        print('[SolveAPI] session cookie 注入成功(CDP)')
+                except Exception as e:
+                    # 回退:页面 evaluate 设置
+                    try:
+                        page.evaluate("(v) => { document.cookie = 'session=' + v + '; path=/'; }", session_cookie)
+                        if verbose:
+                            print('[SolveAPI] session cookie 注入成功(JS)')
+                    except Exception as e2:
+                        if verbose:
+                            print(f'[SolveAPI] session cookie 注入失败: {e} / {e2}')
 
-            # 导航触发 WAF JS 挑战;跳过挑战页等待真实内容
+            # 导航触发 WAF JS 挑战;等待 WAF cookie 就绪 + 页面真实内容
             try:
                 page.goto(base_url, wait_until='domcontentloaded', timeout=45000)
             except Exception:
                 pass
             t0 = time.time()
+            waf_ready = False
             while time.time() - t0 < max_wait:
+                # 检查 acw_tc 等 WAF cookie 是否已种下
+                try:
+                    cookies = ctx.cookies()
+                    has_waf = any(c['name'] in ('acw_tc', 'cdn_sec_tc', 'acw_sc__v2', 'aliyungf_tc') for c in cookies)
+                except Exception:
+                    has_waf = False
                 try:
                     body = page.evaluate("document.body ? document.body.innerText.slice(0,120) : ''")
                     title = page.title()
+                    # 检测真实页面元素(登录表单 / 应用按钮),而非挑战页空壳
+                    has_ui = page.evaluate("""() => {
+                        const s = document.querySelectorAll('input, button, a, .semi-card, #app, #root').length;
+                        const t = document.body ? document.body.innerText.trim().length : 0;
+                        return s > 0 && t > 0;
+                    }""")
                 except Exception:
-                    body, title = '', ''
+                    body, title, has_ui = '', '', False
                 # 挑战页关键词(阿里云 WAF / CF / 网宿)
-                if any(k in body for k in ('验证', '安全', 'captcha', 'verify', 'Access denied',
-                                            '请稍候', 'Just a moment', '检查', 'aliyun')):
-                    if verbose and int(time.time() - t0) % 6 == 0:
-                        print(f'[SolveAPI] 等待 WAF 通过: {body[:40]!r}')
-                    time.sleep(3)
-                    continue
-                # 页面已出现真实内容(登录表单 / 应用 DOM)
-                break
+                is_challenge = any(k in body for k in ('验证', '安全', 'captcha', 'verify', 'Access denied',
+                                                        '请稍候', 'Just a moment', '检查', 'aliyun'))
+                if not is_challenge and has_ui:
+                    waf_ready = True
+                    if verbose:
+                        print('[SolveAPI] WAF 已通过(页面出现真实内容)')
+                    break
+                if has_waf and not is_challenge:
+                    # 已有 WAF cookie 且无挑战关键词,尝试放行
+                    waf_ready = True
+                    if verbose:
+                        print('[SolveAPI] WAF cookie 已就绪,尝试继续')
+                    break
+                # 中途 reload 帮助 WAF JS 重新执行
+                if time.time() - t0 > 8 and int(time.time() - t0) % 10 == 0:
+                    try:
+                        page.reload(wait_until='domcontentloaded', timeout=20000)
+                    except Exception:
+                        pass
+                if verbose and int(time.time() - t0) % 6 == 0:
+                    print(f'[SolveAPI] 等待 WAF: title={title[:30]!r} has_ui={has_ui} waf_cookie={has_waf}')
+                time.sleep(3)
 
             # 页面内 fetch(浏览器已持有有效 WAF cookie + session)
             api_path = path if path.startswith('/') else '/' + path
@@ -664,9 +710,25 @@ def solve_and_api(base_url: str, session_cookie: str = None, auth_headers: dict 
                 }});
                 const text = await resp.text();
                 try {{ return {{ status: resp.status, data: JSON.parse(text) }}; }}
-                catch (e) {{ return {{ status: resp.status, data: null, raw: text.substring(0, 200) }}; }}
+                catch (e) {{ return {{ status: resp.status, data: null, raw: text.substring(0, 300) }}; }}
             }}'''
             result = page.evaluate(js, {'headers': auth_headers})
+            # 若返回的是 WAF HTML(非 JSON),reload 一次后再试
+            for _retry in range(3):
+                if result.get('data') is not None:
+                    break
+                raw = result.get('raw', '')
+                if 'aliyun_waf' in raw or 'Just a moment' in raw or '安全验证' in raw or '<!doctype' in raw.lower():
+                    if verbose:
+                        print(f'[SolveAPI] 仍被 WAF 拦截,第 {_retry+1} 次 reload 重试...')
+                    try:
+                        page.reload(wait_until='domcontentloaded', timeout=20000)
+                    except Exception:
+                        pass
+                    time.sleep(6)
+                    result = page.evaluate(js, {'headers': auth_headers})
+                else:
+                    break
             if verbose:
                 import json as _json
                 print(f'[SolveAPI] {method} {path} -> HTTP {result.get("status")} '
