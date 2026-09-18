@@ -651,6 +651,9 @@ def solve_and_api(base_url: str, session_cookie: str = None, auth_headers: dict 
                         if verbose:
                             print(f'[SolveAPI] session cookie 注入失败: {e} / {e2}')
 
+            # 定义目标 API 路径(供二次挑战导航使用)
+            api_path = path if path.startswith('/') else '/' + path
+
             # 导航触发 WAF JS 挑战;等待 WAF cookie 就绪 + 页面真实内容
             try:
                 page.goto(base_url, wait_until='domcontentloaded', timeout=45000)
@@ -699,6 +702,33 @@ def solve_and_api(base_url: str, session_cookie: str = None, auth_headers: dict 
                 if verbose and int(time.time() - t0) % 6 == 0:
                     print(f'[SolveAPI] 等待 WAF: title={title[:30]!r} has_ui={has_ui} waf_cookie={has_waf}')
                 time.sleep(3)
+
+            # 关键:先导航到目标 API 路径,触发阿里云 WAF 对该路径的二次 JS 挑战
+            # (首页通过不代表 API 路径放行;goto 让挑战 JS 执行并种下 acw_sc__v2 二次 cookie)
+            if waf_ready:
+                try:
+                    page.goto(base_url + api_path, wait_until='domcontentloaded', timeout=45000)
+                except Exception:
+                    pass
+                t1 = time.time()
+                while time.time() - t1 < 30:
+                    try:
+                        body2 = page.evaluate("document.body ? document.body.innerText.slice(0,120) : ''")
+                        cookies2 = ctx.cookies()
+                        has_sec = any(c['name'] in ('acw_sc__v2', 'cdn_sec_tc') for c in cookies2)
+                    except Exception:
+                        body2, has_sec = '', False
+                    if body2.strip().startswith('{'):
+                        if verbose:
+                            print('[SolveAPI] API 路径挑战已通过(返回 JSON)')
+                        break
+                    if has_sec and not any(k in body2 for k in ('验证', '安全', 'Just a moment', '检查')):
+                        if verbose:
+                            print('[SolveAPI] 二次 WAF cookie 已种下,继续')
+                        break
+                    if verbose and int(time.time() - t1) % 6 == 0:
+                        print(f'[SolveAPI] 等待 API 路径挑战: {body2[:30]!r}')
+                    time.sleep(2.5)
 
             # 页面内 fetch(浏览器已持有有效 WAF cookie + session;补全浏览器行为头绕过
             # 阿里云 WAF 对 API 请求的二次校验)
