@@ -337,3 +337,118 @@ def send_serverchan_notification(results: List[Dict[str, Any]], execution_time: 
     except Exception as e:
         print(f'[ServerChan] 推送异常: {e}')
         return False
+
+
+def send_pushplus_notification(results: List[Dict[str, Any]], execution_time: Optional[str] = None) -> bool:
+    """
+    发送 PushPlus 微信推送
+
+    环境变量配置:
+        PUSHPLUS_TOKEN: PushPlus Token (https://www.pushplus.plus)
+    """
+    token = os.environ.get('PUSHPLUS_TOKEN', '')
+
+    if not token:
+        print('[PushPlus] 未配置 PUSHPLUS_TOKEN,跳过通知')
+        return False
+
+    if requests is None:
+        print('[PushPlus] 错误: 未安装 requests 库')
+        return False
+
+    if not execution_time:
+        execution_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    success_count = len([r for r in results if r.get('success')])
+    fail_count = len([r for r in results if not r.get('success')])
+
+    # 构建标题
+    if fail_count == 0:
+        title = f'✅ NewAPI 签到成功 ({success_count}个账号)'
+    elif success_count == 0:
+        title = f'❌ NewAPI 签到失败 ({fail_count}个账号)'
+    else:
+        title = f'📋 NewAPI 签到完成 (成功{success_count}/失败{fail_count})'
+
+    # 构建 Markdown 内容(pushplus 的 markdown 模板无要求,直接用 html/markdown)
+    lines = []
+
+    # 头部
+    lines.append(f'**执行时间**: {execution_time}')
+    lines.append('')
+
+    # 成功列表
+    success_list = [r for r in results if r.get('success')]
+    if success_list:
+        lines.append(f'### ✅ 成功 ({len(success_list)}个)')
+        lines.append('')
+        lines.append('| 账号 | 奖励 | 结果 | 已签 | 抽奖 |')
+        lines.append('|------|------|------|------|------|')
+        for r in success_list:
+            name = r.get('name', '未知账号')
+            quota = r.get('quota_awarded') or 0
+            quota_str = f'+{format_quota(quota)}' if quota > 0 else '-'
+            message = r.get('message', '成功')
+            checkin_count = r.get('checkin_count')
+            days = f'已签 {checkin_count} 天' if checkin_count else '-'
+            lottery = ' / '.join(r.get('lottery', [])) or '-'
+            lines.append(f'| {name} | {quota_str} | {message} | {days} | {lottery} |')
+        lines.append('')
+
+    # 失败列表
+    fail_list_local = [r for r in results if not r.get('success')]
+    if fail_list_local:
+        lines.append(f'### ❌ 失败 ({len(fail_list_local)}个)')
+        lines.append('')
+        lines.append('| 账号 | 原因 |')
+        lines.append('|------|------|')
+        for r in fail_list_local:
+            name = r.get('name', '未知账号')
+            message = r.get('message', '未知错误')
+            if r.get('session_expired') or 'session' in message.lower() or '认证' in message:
+                message = f'⚠️ {message}'
+            lines.append(f'| {name} | {message} |')
+        lines.append('')
+
+    # 汇总
+    total = len(results)
+
+    if fail_count == 0:
+        lines.append(f'**汇总**: 全部成功 ✨ ({success_count}/{total})')
+    elif success_count == 0:
+        lines.append(f'**汇总**: 全部失败 ⚠️ ({fail_count}/{total})')
+    else:
+        lines.append(f'**汇总**: 成功 {success_count},失败 {fail_count}')
+
+    expired_accounts = [r for r in results if not r.get('success') and (
+        r.get('session_expired') or
+        'session' in r.get('message', '').lower() or
+        '认证' in r.get('message', '')
+    )]
+    if expired_accounts:
+        lines.append('')
+        lines.append('> ⚠️ **注意**: 部分账号 Session 已失效,请及时更新 Cookie!')
+
+    content = '\n'.join(lines)
+
+    # PushPlus API: https://www.pushplus.plus/document/guide/userGuide/
+    url = 'https://www.pushplus.plus/send'
+
+    try:
+        resp = requests.post(url, json={
+            'token': token,
+            'title': title,
+            'content': content,
+            'template': 'markdown',
+            'channel': 'wechat',
+        }, timeout=15)
+        result = resp.json()
+        if result.get('code') == 200:
+            print(f'[PushPlus] 推送成功')
+            return True
+        else:
+            print(f'[PushPlus] 推送失败: {result.get("msg", "未知错误")}')
+            return False
+    except Exception as e:
+        print(f'[PushPlus] 推送异常: {e}')
+        return False
