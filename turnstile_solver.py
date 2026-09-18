@@ -243,7 +243,8 @@ def _wait_cf_pass(page, base_url, timeout=60, verbose=True):
 
 
 def solve_and_checkin(base_url: str, sitekey: str = None, auth_headers: dict = None,
-                      proxy: str = None, max_wait: int = 120, verbose: bool = True):
+                      proxy: str = None, max_wait: int = 120, verbose: bool = True,
+                      session_cookie: str = None):
     """
     在站点页面内完成 Turnstile 解验证 + 签到全流程（requests 被 CF 拦也能走通）
 
@@ -252,6 +253,9 @@ def solve_and_checkin(base_url: str, sitekey: str = None, auth_headers: dict = N
         sitekey: Turnstile sitekey，不传则自动从 /api/status 获取
         auth_headers: 签到请求头（Authorization / New-Api-User）
         proxy: 代理地址；默认自动读系统代理（GHA 无代理则为 None）
+        max_wait: 最大等待秒数
+        verbose: 详细输出
+        session_cookie: session cookie(选项,注入后不依赖 Authorization)
     Returns:
         签到接口的 JSON 响应 dict，失败返回 None
     """
@@ -277,10 +281,60 @@ def solve_and_checkin(base_url: str, sitekey: str = None, auth_headers: dict = N
             ctx = browser.contexts[0]
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
+            # 注入 session cookie(若有),保证签到请求带登录态
+            if session_cookie:
+                try:
+                    domain = base_url.replace('https://', '').replace('http://', '').split('/')[0]
+                    ctx.add_cookies([{'name': 'session', 'value': session_cookie,
+                                      'domain': domain, 'path': '/'}])
+                except Exception as e:
+                    if verbose:
+                        print(f'[Turnstile] 注入 session cookie 失败: {e}')
+
             if not _wait_cf_pass(page, base_url, verbose=verbose):
                 if verbose:
                     print('[Turnstile] CF 验证未通过')
                 return None
+
+            # 关键: /api/user/checkin 是路径级 CF 挑战(与 /api/gwent/* 一样),
+            # 必须先导航到该路径触发挑战并等待返回 JSON,否则 POST 会被 CF 拦截
+            try:
+                page.goto(base_url + '/api/user/checkin', wait_until='domcontentloaded', timeout=45000)
+            except Exception:
+                pass
+            t0_ck = time.time()
+            path_ok = False
+            while time.time() - t0_ck < 60:
+                try:
+                    body_ck = page.evaluate("document.body ? document.body.innerText.slice(0,150) : ''")
+                except Exception:
+                    body_ck = ''
+                if body_ck.strip().startswith('{'):
+                    path_ok = True
+                    if verbose:
+                        print('[Turnstile] 签到路径挑战已通过')
+                    break
+                if time.time() - t0_ck > 10:
+                    try:
+                        page.reload(wait_until='domcontentloaded', timeout=20000)
+                    except Exception:
+                        pass
+                    t0_reload = time.time()
+                    while time.time() - t0_reload < 20:
+                        try:
+                            body_ck = page.evaluate("document.body ? document.body.innerText.slice(0,150) : ''")
+                        except Exception:
+                            body_ck = ''
+                        if body_ck.strip().startswith('{'):
+                            path_ok = True
+                            break
+                        time.sleep(3)
+                    if path_ok:
+                        break
+                else:
+                    time.sleep(4)
+            if not path_ok and verbose:
+                print('[Turnstile] 签到路径挑战未通过,继续尝试签到')
 
             # 页面内 JS：PoW 挑战获取 + 求解（SHA-256 前导零比特，与官方 Worker 算法一致）
             SOLVE_POW_JS = '''async (headers) => {

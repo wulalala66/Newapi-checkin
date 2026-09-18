@@ -446,7 +446,8 @@ class NewAPICheckin:
             headers['New-Api-User'] = str(self.user_id)
 
         print('[Turnstile] 启动真实浏览器解验证（会弹出 Chrome 窗口）...')
-        resp_data = solve_and_checkin(self.base_url, auth_headers=headers)
+        resp_data = solve_and_checkin(self.base_url, auth_headers=headers,
+                                      session_cookie=self.session_cookie)
 
         if not resp_data:
             result['message'] = 'Turnstile 验证失败: 未能获取 token 或签到请求失败'
