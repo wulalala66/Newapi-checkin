@@ -980,10 +980,22 @@ def solve_and_gwent(base_url: str, session_cookie: str = None, user_id: str = No
                 }
                 const d = data.data || {};
                 const prize = d.prize || {};
+                // 翻卡后:分享解锁下次 +50% (share_unlock 激活 next_bonus_pct)
+                let share_ok = false, share_msg = '';
+                try {
+                    const shr = await post('/api/gwent/share_unlock', 'POST');
+                    share_ok = !!(shr.json && shr.json.success);
+                    share_msg = shr.json ? (shr.json.message || shr.json.msg || '') : '';
+                } catch (e) { share_msg = String(e); }
                 return {
                     success: true,
                     prize_name: prize.name || '?',
                     quota_awarded: prize.quota || 0,
+                    rarity: prize.rarity || '',
+                    applied_bonus_pct: Number(d.applied_bonus_pct || 0),
+                    should_prompt_share: !!d.should_prompt_share,
+                    share_ok: share_ok,
+                    share_msg: share_msg,
                     remaining: (Number(d.charges_current || 0) + Number(d.extra_draws_left || 0)),
                     status: res.status
                 };
@@ -997,6 +1009,230 @@ def solve_and_gwent(base_url: str, session_cookie: str = None, user_id: str = No
             return result if isinstance(result, dict) else {'error': str(result)}
     except Exception as e:
         print(f'[Turnstile] 翻卡求解失败: {e}')
+        return {'error': str(e)}
+    finally:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
+def solve_and_gwent_tasks(base_url: str, session_cookie: str = None, user_id: str = None,
+                          access_token: str = None, proxy: str = None, max_wait: int = 120,
+                          verbose: bool = True):
+    """
+    单会话完成维云"看广告"+"答题"两个日常任务(奖励=充能翻卡次数)。
+
+    流程:
+      1. 真实 Chrome + CDP 过 WAF / 路径级挑战
+      2. GET /api/gwent/status 解析 tasks.task2(看广告) / task3(答题)
+      3. 看广告: POST /api/gwent/ad/start -> 真等 duration_sec -> POST /api/gwent/ad/claim
+         (后端时间戳硬墙,必须真实等待;受 min_interval_sec 与 daily_cap 限制)
+      4. 答题: POST /api/gwent/task3/start 拿题目 {text,image_url,options};
+         若 status 下发的 quizzes 含正确索引则自动答对,否则记录题目跳过(答案在后端不暴露)
+
+    Returns:
+        {"ad": {广告结果}, "quiz": {答题结果}, "log": [...]}
+    """
+    if proxy is None:
+        proxy = _get_system_proxy()
+    auth_headers = {}
+    if access_token:
+        auth_headers['Authorization'] = access_token
+    if user_id:
+        auth_headers['New-Api-User'] = str(user_id)
+
+    proc, dbg_port = _launch_chrome(proxy, url=base_url)
+    import json as _json
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = None
+            for _ in range(3):
+                try:
+                    browser = p.chromium.connect_over_cdp(f'http://127.0.0.1:{dbg_port}')
+                    break
+                except Exception as e:
+                    time.sleep(3)
+            if browser is None:
+                return {'error': 'CDP 连接失败'}
+            ctx = browser.contexts[0]
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+
+            if session_cookie:
+                domain = base_url.replace('https://', '').replace('http://', '').split('/')[0]
+                try:
+                    ctx.add_cookies([{'name': 'session', 'value': session_cookie,
+                                      'domain': domain, 'path': '/'}])
+                except Exception:
+                    pass
+
+            if not _wait_cf_pass(page, base_url, timeout=60, verbose=verbose):
+                return {'error': 'CF 首页挑战未通过'}
+
+            # 导航 gwent status 触发路径级挑战
+            try:
+                page.goto(base_url + '/api/gwent/status', wait_until='domcontentloaded', timeout=45000)
+            except Exception:
+                pass
+            t0 = time.time()
+            while time.time() - t0 < 60:
+                try:
+                    body = page.evaluate("document.body ? document.body.innerText.slice(0,150) : ''")
+                except Exception:
+                    body = ''
+                if body.strip().startswith('{'):
+                    break
+                time.sleep(3)
+
+            def fetch_api(path, method='GET'):
+                js = (
+                    "async (args) => {"
+                    "  const h = Object.assign({"
+                    "    'Accept':'application/json','X-Requested-With':'XMLHttpRequest',"
+                    "    'Referer': location.origin + '/', 'Origin': location.origin,"
+                    "    'Sec-Fetch-Dest':'empty','Sec-Fetch-Mode':'cors','Sec-Fetch-Site':'same-origin'"
+                    "  }, args.headers || {});"
+                    "  const resp = await fetch('" + path + "', { method:'" + method + "', headers:h, credentials:'include' });"
+                    "  const text = await resp.text();"
+                    "  try { return { status: resp.status, data: JSON.parse(text) }; }"
+                    "  catch(e) { return { status: resp.status, data: null, raw: text.substring(0,200) }; }"
+                    "}"
+                )
+                return page.evaluate(js, {'headers': auth_headers})
+
+            result = {'ad': {}, 'quiz': {}, 'log': []}
+
+            # 1) 拿 status 的 tasks
+            st = fetch_api('/api/gwent/status', 'GET')
+            tasks = {}
+            if st and st.get('data'):
+                d = st['data']
+                if isinstance(d, dict):
+                    inner = d.get('data') if isinstance(d.get('data'), dict) else {}
+                    tasks = inner.get('tasks') if isinstance(inner, dict) else (tasks or {})
+            ad = tasks.get('task2') if isinstance(tasks, dict) else {}
+            quiz = tasks.get('task3') if isinstance(tasks, dict) else {}
+            if verbose:
+                print(f'[Tasks] ad.enabled={ad.get("enabled")} daily_cap={ad.get("daily_cap")} '
+                      f'done={ad.get("done_count")} dur={ad.get("duration_sec")} '
+                      f'next_at={ad.get("next_available_at")}')
+                print(f'[Tasks] quiz.enabled={quiz.get("enabled")} suspended={quiz.get("suspended")} '
+                      f'time_limit={quiz.get("time_limit_sec")} quizzes={len(quiz.get("quizzes") or [])}')
+            result['tasks_raw'] = {'ad': ad, 'quiz': quiz}
+
+            # 2) 看广告
+            if ad.get('enabled') and not ad.get('suspended'):
+                left = int(ad.get('daily_cap') or 0) - int(ad.get('done_count') or 0)
+                done_ad = []
+                for i in range(max(0, left)):
+                    # min_interval 间隔检查
+                    nxt = ad.get('next_available_at')
+                    if nxt and time.time() < int(nxt or 0):
+                        if verbose:
+                            print(f'[Tasks] 广告处于间隔冷却,跳过剩余(下次可用 '
+                                  f'{datetime.fromtimestamp(int(nxt)).strftime("%H:%M:%S")})')
+                        break
+                    s2 = fetch_api('/api/gwent/ad/start', 'POST')
+                    if not (s2 and s2.get('data') and s2['data'].get('success')):
+                        msg = (s2.get('data') or {}).get('message') if s2 else '网络错误'
+                        if verbose:
+                            print(f'[Tasks] 广告开始失败: {msg}')
+                        break
+                    dur = int((s2['data'].get('data') or {}).get('duration_sec') or 15)
+                    if verbose:
+                        print(f'[Tasks] 看广告中,等待 {dur} 秒...')
+                    time.sleep(dur + 1)  # 后端时间戳硬墙,真实等待
+                    c2 = fetch_api('/api/gwent/ad/claim', 'POST')
+                    ok = bool(c2 and c2.get('data') and c2['data'].get('success'))
+                    done_ad.append({
+                        'ok': ok,
+                        'msg': (c2.get('data') or {}).get('message', '') if c2 else '网络错误',
+                    })
+                    if verbose:
+                        print(f'[Tasks] 广告 #%d 领奖: %s' % (i + 1,
+                              '成功' if ok else (done_ad[-1]['msg'])))
+                    # 重新拉 status 更新剩余次/next_available_at
+                    st3 = fetch_api('/api/gwent/status', 'GET')
+                    if st3 and st3.get('data'):
+                        d3 = st3['data']
+                        tasks3 = {}
+                        if isinstance(d3, dict):
+                            inner3 = d3.get('data') if isinstance(d3.get('data'), dict) else {}
+                            tasks3 = inner3.get('tasks') if isinstance(inner3, dict) else {}
+                        ad = tasks3.get('task2') if isinstance(tasks3, dict) else {}
+                result['ad'] = {'done': len([x for x in done_ad if x['ok']]),
+                                'detail': done_ad}
+            else:
+                if verbose:
+                    print('[Tasks] 看广告未开启或暂停,跳过')
+                result['ad'] = {'done': 0, 'detail': [], 'note': '未开启'}
+
+            # 3) 答题
+            if quiz.get('enabled') and not quiz.get('suspended'):
+                s3 = fetch_api('/api/gwent/task3/start', 'POST')
+                if s3 and s3.get('data') and s3['data'].get('success'):
+                    qd = s3['data'].get('data') or {}
+                    question = qd.get('question') or {}
+                    qtext = question.get('text', '')
+                    qoptions = question.get('options') or []
+                    # 尝试从 status 下发的 quizzes 找正确索引
+                    answer_idx = None
+                    quizzes = quiz.get('quizzes') or []
+                    for q in quizzes:
+                        if q.get('text') == qtext and ('correct_index' in q):
+                            answer_idx = int(q.get('correct_index', -1))
+                            break
+                    result['quiz']['question'] = qtext
+                    result['quiz']['options'] = qoptions
+                    # 无正确答案则随机选一个(答对概率比不答强)
+                    if answer_idx is None or answer_idx < 0 or answer_idx >= len(qoptions):
+                        import random as _random
+                        answer_idx = _random.randint(0, max(0, len(qoptions) - 1)) if qoptions else _random.randint(0, 3)
+                        result['quiz']['guessed'] = True
+                    if answer_idx is not None:
+                        a3 = fetch_api('/api/gwent/task3/answer', 'POST')
+                        # answer 需要 body {answer_index}
+                        # 用专门带 body 的 fetch
+                        a3 = page.evaluate(
+                            "async (args) => {"
+                            "  const h = Object.assign({'Accept':'application/json','Content-Type':'application/json','X-Requested-With':'XMLHttpRequest','Referer': location.origin + '/','Origin': location.origin,'Sec-Fetch-Dest':'empty','Sec-Fetch-Mode':'cors','Sec-Fetch-Site':'same-origin'}, args.headers || {});"
+                            "  const resp = await fetch('/api/gwent/task3/answer', { method:'POST', headers:h, body: JSON.stringify({answer_index: args.answer_index}), credentials:'include' });"
+                            "  const text = await resp.text();"
+                            "  try { return { status: resp.status, data: JSON.parse(text) }; }"
+                            "  catch(e) { return { status: resp.status, data: null, raw: text.substring(0,200) }; }"
+                            "}",
+                            {'headers': auth_headers, 'answer_index': answer_idx})
+                        if a3 and a3.get('data') and a3['data'].get('success'):
+                            correct = (a3['data'].get('data') or {}).get('correct')
+                            result['quiz']['answered'] = True
+                            result['quiz']['correct'] = correct
+                            if verbose:
+                                print(f'[Tasks] 答题提交 index={answer_idx} -> correct={correct}')
+                        else:
+                            result['quiz']['answered'] = False
+                            result['quiz']['msg'] = (a3.get('data') or {}).get('message', '') if a3 else '网络错误'
+                            if verbose:
+                                print(f'[Tasks] 答题提交失败: {result["quiz"]["msg"]}')
+                    else:
+                        result['quiz']['answered'] = False
+                        result['quiz']['note'] = 'quizzes 未下发答案,需人工答题(题目已记录)'
+                        if verbose:
+                            print(f'[Tasks] 答题未自动答: 题目={qtext!r} 选项={qoptions}')
+                else:
+                    result['quiz']['answered'] = False
+                    result['quiz']['msg'] = 'task3/start 失败'
+                    if verbose:
+                        print('[Tasks] 答题开始失败')
+            else:
+                if verbose:
+                    print('[Tasks] 答题未开启或暂停,跳过')
+                result['quiz'] = {'answered': False, 'note': '未开启'}
+
+            browser.close()
+            return result
+    except Exception as e:
+        print(f'[Tasks] 任务执行失败: {e}')
         return {'error': str(e)}
     finally:
         try:

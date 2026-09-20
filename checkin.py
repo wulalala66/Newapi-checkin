@@ -1031,11 +1031,35 @@ def main():
             if 'vsllm.cc' not in url and 'vsllm.com' not in url:
                 print(f'  跳过: 非维云站点,翻卡模式仅支持 vsllm.cc/vsllm.com')
                 continue
-            print(f'  站点: {NewAPICheckin._mask_url(url)} [浏览器内翻卡]')
+            print(f'  站点: {NewAPICheckin._mask_url(url)} [任务+翻卡]')
             drew = 0
             prize = None
             err = None
             drawn_items = []
+            task_items = []
+
+            # 先做日常任务(看广告/答题,奖励=充能翻卡次数),再做翻卡
+            try:
+                from turnstile_solver import solve_and_gwent_tasks
+                print('  任务: 使用真实 Chrome 过 CF 执行看广告/答题...')
+                tk = solve_and_gwent_tasks(url, session_cookie=session_cookie,
+                                           user_id=user_id, access_token=access_token)
+                ad = tk.get('ad') or {}
+                quiz = tk.get('quiz') or {}
+                n_ad = int(ad.get('done') or 0)
+                if n_ad:
+                    task_items.append(f'📺 看广告 x{n_ad}')
+                if quiz.get('answered'):
+                    task_items.append(f'🧠 答题 {"✅正确" if quiz.get("correct") else "❌错误"}')
+                elif quiz.get('note') and quiz.get('note') != '未开启':
+                    task_items.append(f'🧠 答题未自动({quiz["note"]})')
+                if task_items:
+                    print('  任务: ' + ' / '.join(task_items))
+                else:
+                    print('  任务: 无可用(未开启或已完成)')
+            except Exception as e:
+                print(f'  任务: 执行失败 {e}')
+            drawn_items = task_items + drawn_items
             for rnd in range(3):
                 browser_result = None
                 err = None
@@ -1170,57 +1194,7 @@ def main():
                             if prize.get('remaining_times', 0) <= 0:
                                 break
 
-            # 维云翻卡（本地和 GitHub Actions 都运行，最多 3 次）
-            # 触发条件适配 vsllm.cc / vsllm.com;每次抽取后按接口返回的剩余次数继续
-            # CF 拦截时自动降级到浏览器内翻卡(bypass_and_gwent)
-            if run_gwent_for_account and ('vsllm.cc' in url or 'vsllm.com' in url):
-                for rnd in range(3):
-                    prize = None
-                    err = None
-                    # 尝试直连翻卡
-                    try:
-                        prize, err = run_gwent_for_account(client.session, url)
-                    except Exception as e:
-                        err = f'翻卡异常: {e}'
-                    # 直连被 CF 拦截 → 浏览器内翻卡
-                    if err and CloudflareBypasser is not None and (
-                        'Cloudflare' in err or 'Just a moment' in err or 'cf' in err.lower()
-                        or '403' in err or '非JSON' in err
-                    ):
-                        print(f'  翻卡: 直连被 CF 拦截,降级浏览器内翻卡...')
-                        try:
-                            bypasser = CloudflareBypasser(url, session_cookie, user_id, access_token)
-                            browser_result = bypasser.bypass_and_gwent()
-                            if browser_result is None:
-                                err = '浏览器翻卡执行失败'
-                            elif browser_result.get('empty'):
-                                prize = None
-                                err = '⏭️ 今日已无翻卡次数'
-                            elif browser_result.get('success'):
-                                prize = {
-                                    'prize_name': browser_result.get('prize_name'),
-                                    'quota_awarded': browser_result.get('quota_awarded', 0),
-                                    'remaining_times': browser_result.get('remaining', 0),
-                                }
-                                err = None
-                            else:
-                                err = browser_result.get('message') or browser_result.get('error') or '翻卡失败'
-                        except Exception as e:
-                            err = f'浏览器翻卡异常: {e}'
-                    if err:
-                        lottery_items.append(f'⏭️ {err}')
-                        print(f'  翻卡: ⏭️ {err}')
-                        break
-                    if prize:
-                        q = prize.get('quota_awarded', 0)
-                        qs = f'{q/1000000:.2f}M' if q >= 1000000 else f'{q/1000:.2f}K' if q >= 1000 else str(q)
-                        line = f'🎉 第{rnd+1}次 {prize["prize_name"]} +{qs}'
-                        lottery_items.append(line)
-                        print(f'  翻卡: {line}')
-                        # 剩余次数不足则停
-                        if int(prize.get('remaining_times', 0) or 0) <= 0:
-                            break
-
+            # 维云翻卡已独立由 gwent 定时工作流(--gwent-only)执行,签到流程不再翻卡
             # 收集结果用于钉钉通知
             account_result = {
                 'name': name,
