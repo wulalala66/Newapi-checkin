@@ -1172,66 +1172,83 @@ def solve_and_gwent_tasks(base_url: str, session_cookie: str = None, user_id: st
                     print('[Tasks] 看广告未开启或暂停,跳过')
                 result['ad'] = {'done': 0, 'detail': [], 'note': '未开启'}
 
-            # 3) 答题(判断依据:task3 存在 + 未暂停;无 enabled 字段)
-            if quiz and not quiz.get('suspended'):
-                s3 = fetch_api('/api/gwent/task3/start', 'POST')
-                if s3 and s3.get('data') and s3['data'].get('success'):
+            # 3) 答题(判断依据:task3 存在 + 未暂停;status=won 表示今日已答对可跳过)
+            q_status = (quiz or {}).get('status')
+            if quiz and not quiz.get('suspended') and q_status != 'won':
+                attempts = 0
+                got_correct = False
+                for attempt in range(3):
+                    s3 = fetch_api('/api/gwent/task3/start', 'POST')
+                    if not (s3 and s3.get('data') and s3['data'].get('success')):
+                        msg = (s3.get('data') or {}).get('message') if s3 else '网络错误'
+                        result['quiz']['msg'] = msg or 'task3/start 失败'
+                        if verbose:
+                            print(f'[Tasks] 答题开始失败: {result["quiz"]["msg"]}')
+                        break
                     qd = s3['data'].get('data') or {}
                     question = qd.get('question') or {}
                     qtext = question.get('text', '')
                     qoptions = question.get('options') or []
-                    # 尝试从 status 下发的 quizzes 找正确索引
+                    # 优先使用 status 下发的 quizzes 中匹配的正确答案
                     answer_idx = None
-                    quizzes = quiz.get('quizzes') or []
-                    for q in quizzes:
+                    for q in (quiz.get('quizzes') or []):
                         if q.get('text') == qtext and ('correct_index' in q):
                             answer_idx = int(q.get('correct_index', -1))
                             break
-                    result['quiz']['question'] = qtext
-                    result['quiz']['options'] = qoptions
-                    # 无正确答案则随机选一个(答对概率比不答强)
+                    guessed = False
                     if answer_idx is None or answer_idx < 0 or answer_idx >= len(qoptions):
                         import random as _random
-                        answer_idx = _random.randint(0, max(0, len(qoptions) - 1)) if qoptions else _random.randint(0, 3)
-                        result['quiz']['guessed'] = True
-                    if answer_idx is not None:
-                        a3 = fetch_api('/api/gwent/task3/answer', 'POST')
-                        # answer 需要 body {answer_index}
-                        # 用专门带 body 的 fetch
-                        a3 = page.evaluate(
-                            "async (args) => {"
-                            "  const h = Object.assign({'Accept':'application/json','Content-Type':'application/json','X-Requested-With':'XMLHttpRequest','Referer': location.origin + '/','Origin': location.origin,'Sec-Fetch-Dest':'empty','Sec-Fetch-Mode':'cors','Sec-Fetch-Site':'same-origin'}, args.headers || {});"
-                            "  const resp = await fetch('/api/gwent/task3/answer', { method:'POST', headers:h, body: JSON.stringify({answer_index: args.answer_index}), credentials:'include' });"
-                            "  const text = await resp.text();"
-                            "  try { return { status: resp.status, data: JSON.parse(text) }; }"
-                            "  catch(e) { return { status: resp.status, data: null, raw: text.substring(0,200) }; }"
-                            "}",
-                            {'headers': auth_headers, 'answer_index': answer_idx})
-                        if a3 and a3.get('data') and a3['data'].get('success'):
-                            correct = (a3['data'].get('data') or {}).get('correct')
-                            result['quiz']['answered'] = True
-                            result['quiz']['correct'] = correct
+                        answer_idx = (_random.randint(0, len(qoptions) - 1) if qoptions
+                                      else _random.randint(0, 3))
+                        guessed = True
+                    result['quiz']['question'] = qtext
+                    result['quiz']['options'] = qoptions
+                    result['quiz']['answer_index'] = answer_idx
+                    result['quiz']['guessed'] = guessed
+                    attempts += 1
+                    a3 = page.evaluate(
+                        "async (args) => {"
+                        "  const h = Object.assign({'Accept':'application/json','Content-Type':'application/json','X-Requested-With':'XMLHttpRequest','Referer': location.origin + '/','Origin': location.origin,'Sec-Fetch-Dest':'empty','Sec-Fetch-Mode':'cors','Sec-Fetch-Site':'same-origin'}, args.headers || {});"
+                        "  const resp = await fetch('/api/gwent/task3/answer', { method:'POST', headers:h, body: JSON.stringify({answer_index: args.answer_index}), credentials:'include' });"
+                        "  const text = await resp.text();"
+                        "  try { return { status: resp.status, data: JSON.parse(text) }; }"
+                        "  catch(e) { return { status: resp.status, data: null, raw: text.substring(0,200) }; }"
+                        "}",
+                        {'headers': auth_headers, 'answer_index': answer_idx})
+                    if a3 and a3.get('data') and a3['data'].get('success'):
+                        correct = (a3['data'].get('data') or {}).get('correct')
+                        result['quiz']['answered'] = True
+                        result['quiz']['correct'] = correct
+                        if verbose:
+                            print(f'[Tasks] 答题 #{attempts} index={answer_idx} -> correct={correct}')
+                        if correct:
+                            got_correct = True
+                            break
+                        # 答错:重新查 status,若已结束则停止重试
+                        stq = fetch_api('/api/gwent/status', 'GET')
+                        newq = {}
+                        if stq and isinstance(stq.get('data'), dict):
+                            inner = stq['data'].get('data') if isinstance(stq['data'].get('data'), dict) else {}
+                            newq = (inner.get('tasks') or {}).get('task3') or {}
+                        q_status = newq.get('status')
+                        if q_status in ('won', 'lost'):
                             if verbose:
-                                print(f'[Tasks] 答题提交 index={answer_idx} -> correct={correct}')
-                        else:
-                            result['quiz']['answered'] = False
-                            result['quiz']['msg'] = (a3.get('data') or {}).get('message', '') if a3 else '网络错误'
-                            if verbose:
-                                print(f'[Tasks] 答题提交失败: {result["quiz"]["msg"]}')
+                                print(f'[Tasks] 答题已结束(status={q_status}),停止重试')
+                            break
                     else:
                         result['quiz']['answered'] = False
-                        result['quiz']['note'] = 'quizzes 未下发答案,需人工答题(题目已记录)'
+                        result['quiz']['msg'] = (a3.get('data') or {}).get('message', '') if a3 else '网络错误'
                         if verbose:
-                            print(f'[Tasks] 答题未自动答: 题目={qtext!r} 选项={qoptions}')
-                else:
-                    result['quiz']['answered'] = False
-                    result['quiz']['msg'] = 'task3/start 失败'
-                    if verbose:
-                        print('[Tasks] 答题开始失败')
+                            print(f'[Tasks] 答题提交失败: {result["quiz"]["msg"]}')
+                        break
+                result['quiz']['attempts'] = attempts
+                if not got_correct and result['quiz'].get('correct') is False:
+                    result['quiz']['note'] = f'答题未答对(随机{attempts}次)'
             else:
                 if verbose:
-                    print('[Tasks] 答题未开启或暂停,跳过')
-                result['quiz'] = {'answered': False, 'note': '未开启'}
+                    print(f'[Tasks] 答题跳过(status={q_status}, suspended={(quiz or {}).get("suspended")})')
+                result['quiz'] = {'answered': False,
+                                  'note': ('今日已答对' if q_status == 'won' else '未开启')}
 
             browser.close()
             return result
