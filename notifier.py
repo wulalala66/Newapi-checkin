@@ -18,6 +18,24 @@ except ImportError:
     requests = None
 
 
+def safe_join_lottery(items, sep: str = ' / ') -> str:
+    """安全拼接翻卡/任务结果:过滤非字符串元素,避免 dict 混入导致 TypeError"""
+    if not items:
+        return '-'
+    parts = []
+    for it in items:
+        if isinstance(it, str):
+            parts.append(it)
+        elif isinstance(it, dict):
+            # 结构化结果兜底:优先取 name/quota,否则跳过
+            name = it.get('prize_name') or it.get('name')
+            if name:
+                parts.append(f"{name} +{it.get('quota_awarded', it.get('quota', 0))}")
+        elif it is not None:
+            parts.append(str(it))
+    return sep.join(parts) if parts else '-'
+
+
 def format_quota(quota: int) -> str:
     """格式化额度显示"""
     if quota >= 1000000:
@@ -49,7 +67,7 @@ def build_report_text(results: List[Dict[str, Any]], execution_time: str) -> str
             quota_str = f'+{format_quota(quota)}' if quota > 0 else '-'
             checkin_count = r.get('checkin_count')
             detail = f'已签 {checkin_count} 天' if checkin_count else r.get('message', '成功')
-            lottery = ' / '.join(r.get('lottery', [])) or '-'
+            lottery = safe_join_lottery(r.get('lottery', []))
             lines.append(f'  {name} | {quota_str} | {detail} | {lottery}')
         lines.append('')
 
@@ -103,7 +121,7 @@ def build_report_html(results: List[Dict[str, Any]], execution_time: str) -> str
             quota_str = f'+{format_quota(quota)}' if quota > 0 else '-'
             checkin_count = r.get('checkin_count')
             detail = f'已签 {checkin_count} 天' if checkin_count else r.get('message', '成功')
-            lottery = ' / '.join(r.get('lottery', [])) or '-'
+            lottery = safe_join_lottery(r.get('lottery', []))
             rows += f'<tr><td style="padding:4px 10px;">{name}</td>'
             rows += f'<td style="padding:4px 10px;">{quota_str}</td>'
             rows += f'<td style="padding:4px 10px;">{detail}</td>'
@@ -282,7 +300,7 @@ def send_serverchan_notification(results: List[Dict[str, Any]], execution_time: 
             message = r.get('message', '成功')
             checkin_count = r.get('checkin_count')
             days = f'已签 {checkin_count} 天' if checkin_count else '-'
-            lottery = ' / '.join(r.get('lottery', [])) or '-'
+            lottery = safe_join_lottery(r.get('lottery', []))
             lines.append(f'| {name} | {quota_str} | {message} | {days} | {lottery} |')
         lines.append('')
 
@@ -395,7 +413,7 @@ def send_pushplus_notification(results: List[Dict[str, Any]], execution_time: Op
             message = r.get('message', '成功')
             checkin_count = r.get('checkin_count')
             days = f'已签 {checkin_count} 天' if checkin_count else '-'
-            lottery = ' / '.join(r.get('lottery', [])) or '-'
+            lottery = safe_join_lottery(r.get('lottery', []))
             lines.append(f'| {name} | {quota_str} | {message} | {days} | {lottery} |')
         lines.append('')
 

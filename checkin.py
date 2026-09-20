@@ -1097,7 +1097,6 @@ def main():
                 qs = f'{q/1000000:.2f}M' if q >= 1000000 else f'{q/1000:.2f}K' if q >= 1000 else str(q)
                 line = f'🎉 第{rnd+1}次 {browser_result.get("prize_name", "?")} +{qs}'
                 drawn_items.append(line)
-                drawn_items.append(browser_result)
                 print(f'  翻卡: {line}')
                 drew += 1
                 if int(browser_result.get('remaining', 0) or 0) <= 0:

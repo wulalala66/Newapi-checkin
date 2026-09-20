@@ -19,7 +19,7 @@ try:
 except ImportError:
     requests = None
 
-from notifier import format_quota
+from notifier import format_quota, safe_join_lottery
 
 
 class DingTalkNotifier:
@@ -190,7 +190,7 @@ def build_checkin_report(results: List[Dict[str, Any]], execution_time: str) -> 
             quota_str = f'+{format_quota(quota)}' if quota else '-'
             checkin_count = r.get('checkin_count')
             detail = f'已签 {checkin_count} 天' if checkin_count else r.get('message', '成功')
-            lottery = '<br/>'.join(r.get('lottery', [])) or '-'
+            lottery = safe_join_lottery(r.get('lottery', []), sep='<br/>')
             lines.append(f'| {name} | {quota_str} | {detail} | {lottery} |')
         lines.append('')
     
