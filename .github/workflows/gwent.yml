@@ -1,10 +1,10 @@
-name: 维云翻卡 (每6小时)
+name: 维云翻卡 (每4小时)
 
 on:
-  # 每 6 小时检查翻卡(charges_max=2, 使用后 7200s 恢复 1 格;翻卡有每日次数上限,
+  # 每 4 小时检查翻卡(charges_max=2, 使用后 7200s 恢复 1 格;翻卡有每日次数上限,
   # 低频定时即可吃满机会,且不会因 GitHub schedule 频率限制被跳过)
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 */4 * * *'
   # 手动触发
   workflow_dispatch:
 
