@@ -1258,9 +1258,21 @@ def main():
         print('[警告] 已配置 SERVERCHAN_SENDKEY 但无法导入通知模块')
 
     # 发送 PushPlus 微信通知
-    if send_pushplus_notification and not (notify_only_fail and fail_count == 0):
+    # gwent 模式:仅在有实际任务/翻卡动作时推送,避免每 4 小时"无次数"刷屏
+    if gwent_only:
+        has_action = any(
+            any(('🎉' in str(x)) or ('📺' in str(x)) or ('🧠' in str(x))
+                for x in (r.get('lottery') or []))
+            for r in checkin_results
+        )
+    else:
+        has_action = True
+    if gwent_only and not has_action:
+        print('[通知] 本次无任务/翻卡动作,跳过推送')
+    elif send_pushplus_notification and not (notify_only_fail and fail_count == 0):
         print('正在发送 PushPlus 通知...')
-        send_pushplus_notification(checkin_results, execution_time)
+        send_pushplus_notification(checkin_results, execution_time,
+                                   mode=('gwent' if gwent_only else 'checkin'))
     elif os.environ.get('PUSHPLUS_TOKEN'):
         print('[警告] 已配置 PUSHPLUS_TOKEN 但无法导入通知模块')
 

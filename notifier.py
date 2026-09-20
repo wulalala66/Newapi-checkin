@@ -251,13 +251,14 @@ def send_serverchan_notification(results: List[Dict[str, Any]], execution_time: 
     success_count = len([r for r in results if r.get('success')])
     fail_count = len([r for r in results if not r.get('success')])
 
-    # 构建标题
+    # 构建标题(mode='gwent' 时用于维云任务+翻卡报告)
+    label = '维云任务' if mode == 'gwent' else 'NewAPI 签到'
     if fail_count == 0:
-        title = f'✅ NewAPI 签到成功 ({success_count}个账号)'
+        title = f'✅ {label}成功 ({success_count}个账号)'
     elif success_count == 0:
-        title = f'❌ NewAPI 签到失败 ({fail_count}个账号)'
+        title = f'❌ {label}失败 ({fail_count}个账号)'
     else:
-        title = f'📋 NewAPI 签到完成 (成功{success_count}/失败{fail_count})'
+        title = f'📋 {label}完成 (成功{success_count}/失败{fail_count})'
 
     # 构建 Markdown 内容
     lines = []
@@ -339,7 +340,8 @@ def send_serverchan_notification(results: List[Dict[str, Any]], execution_time: 
         return False
 
 
-def send_pushplus_notification(results: List[Dict[str, Any]], execution_time: Optional[str] = None) -> bool:
+def send_pushplus_notification(results: List[Dict[str, Any]], execution_time: Optional[str] = None,
+                               mode: str = 'checkin') -> bool:
     """
     发送 PushPlus 微信推送
 
