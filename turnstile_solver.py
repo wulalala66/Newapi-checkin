@@ -1120,9 +1120,13 @@ def solve_and_gwent_tasks(base_url: str, session_cookie: str = None, user_id: st
                 print(f'[Tasks] quiz.enabled={quiz.get("enabled")} suspended={quiz.get("suspended")} '
                       f'time_limit={quiz.get("time_limit_sec")} quizzes={len(quiz.get("quizzes") or [])}')
             result['tasks_raw'] = {'ad': ad, 'quiz': quiz}
+            if verbose:
+                print(f'[Tasks] raw task2={_json.dumps(ad, ensure_ascii=False)[:200]}')
+                print(f'[Tasks] raw task3={_json.dumps(quiz, ensure_ascii=False)[:200]}')
 
-            # 2) 看广告
-            if ad.get('enabled') and not ad.get('suspended'):
+            # 2) 看广告(判断依据:task2 存在 + 未暂停 + 剩余次数>0;无 enabled 字段)
+            ad_left = int((ad or {}).get('daily_cap') or 0) - int((ad or {}).get('done_count') or 0)
+            if ad and not ad.get('suspended') and ad_left > 0:
                 left = int(ad.get('daily_cap') or 0) - int(ad.get('done_count') or 0)
                 done_ad = []
                 for i in range(max(0, left)):
@@ -1168,8 +1172,8 @@ def solve_and_gwent_tasks(base_url: str, session_cookie: str = None, user_id: st
                     print('[Tasks] 看广告未开启或暂停,跳过')
                 result['ad'] = {'done': 0, 'detail': [], 'note': '未开启'}
 
-            # 3) 答题
-            if quiz.get('enabled') and not quiz.get('suspended'):
+            # 3) 答题(判断依据:task3 存在 + 未暂停;无 enabled 字段)
+            if quiz and not quiz.get('suspended'):
                 s3 = fetch_api('/api/gwent/task3/start', 'POST')
                 if s3 and s3.get('data') and s3['data'].get('success'):
                     qd = s3['data'].get('data') or {}
