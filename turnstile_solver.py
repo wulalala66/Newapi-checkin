@@ -1177,7 +1177,8 @@ def solve_and_gwent_tasks(base_url: str, session_cookie: str = None, user_id: st
             if quiz and not quiz.get('suspended') and q_status != 'won':
                 attempts = 0
                 got_correct = False
-                for attempt in range(3):
+                tried_idx = []  # 已试过的选项(排除法,同题4次可覆盖)
+                for attempt in range(4):
                     s3 = fetch_api('/api/gwent/task3/start', 'POST')
                     if not (s3 and s3.get('data') and s3['data'].get('success')):
                         msg = (s3.get('data') or {}).get('message') if s3 else '网络错误'
@@ -1198,9 +1199,12 @@ def solve_and_gwent_tasks(base_url: str, session_cookie: str = None, user_id: st
                     guessed = False
                     if answer_idx is None or answer_idx < 0 or answer_idx >= len(qoptions):
                         import random as _random
-                        answer_idx = (_random.randint(0, len(qoptions) - 1) if qoptions
-                                      else _random.randint(0, 3))
+                        n_opt = len(qoptions) if qoptions else 4
+                        pool = [i for i in range(n_opt) if i not in tried_idx]
+                        answer_idx = _random.choice(pool) if pool else _random.randint(0, n_opt - 1)
                         guessed = True
+                    if answer_idx not in tried_idx:
+                        tried_idx.append(answer_idx)
                     result['quiz']['question'] = qtext
                     result['quiz']['options'] = qoptions
                     result['quiz']['answer_index'] = answer_idx
@@ -1220,7 +1224,7 @@ def solve_and_gwent_tasks(base_url: str, session_cookie: str = None, user_id: st
                         result['quiz']['answered'] = True
                         result['quiz']['correct'] = correct
                         if verbose:
-                            print(f'[Tasks] 答题 #{attempts} index={answer_idx} -> correct={correct}')
+                            print(f'[Tasks] 答题 #{attempts} Q={qtext[:40]!r} index={answer_idx} -> correct={correct}')
                         if correct:
                             got_correct = True
                             break
