@@ -1,9 +1,9 @@
 name: NewAPI 自动签到
 
 on:
-  # 定时执行：每8小时触发一次
+  # 定时执行：每12小时触发一次
   schedule:
-    - cron: '0 */8 * * *'
+    - cron: '0 */12 * * *'
   # 手动触发
   workflow_dispatch:
 
